@@ -17,6 +17,17 @@ vizuální panel pro 3D atributy – místo hledání klíčů jako `roof:height
 - **Upozornění** na podezřelé hodnoty: střecha vyšší než budova, `min_height` ≥ `height`,
   pozůstatky importu z RÚIAN (`building:flats` u kostela…), desetinná čárka místo tečky.
 - **Věže a části budovy** – návod a předvyplnění věže.
+- **Předvolby typů budov** – Panelák, Cihlový bytový dům, Rodinný dům, Řadový dům, Obchodní centrum,
+  Hala / sklad, Garáže. Doplní **jen prázdné** hodnoty (tvar a materiál střechy, typ budovy z `yes`,
+  výšku z podlaží); pravděpodobný typ podle značek se zvýrazní. Hodnoty jsou v tabulce `PREDVOLBY` ve skriptu.
+- **Více budov najednou** – při výběru víc budov stejného typu (`building=`) panel nabídne předvolby
+  a „Bez oken“; doplní jen značky, které nemá žádná z nich, ostatní značky nechá být.
+- **Dopočet výšky z podlaží** (`height = podlaží × výška patra + střecha`) a upozornění na nereálnou
+  výšku patra (pod 2,2 m nebo nad 6 m).
+- **Sklon střechy** (`roof:angle`) a u pultové střechy **směr spádu** (`roof:direction`) šipkami.
+- **Podzemní podlaží** (`building:levels:underground`), přepínač **Bez oken** (`window=no`).
+- **Průjezd** – u části budovy tlačítko „Část nad průjezdem“ (`min_height=4`, `building:min_level=1`)
+  a návod (`tunnel=building_passage` na cestě pod budovou).
 - Desetinná čárka se při zadání převede na tečku, neplatné číslo se nezapíše.
 
 Panel nic neukládá sám: každá akce je obyčejná úprava v iD (jeden krok **Zpět**),
@@ -39,7 +50,8 @@ iD nemá rozhraní pro pluginy a Tampermonkey skript na osm.org spouští až po
 Panel proto čte a zapisuje značky přes **textové zobrazení sekce „Značky“** v iD – přesně tak,
 jako by je uživatel napsal ručně. Validaci, historii i ukládání tak řeší iD samo.
 
-Pojistky: panel nic nezapíše při výběru více prvků, u značek s mezerou na začátku/konci
+Pojistky: při výběru více prvků zapisuje jen předvolby a „Bez oken“ (řádky `klíč=*`, které iD
+ukazuje u rozdílných hodnot, nechává beze změny – iD je pak přeskočí); nic nezapíše u značek s mezerou na začátku/konci
 (změnil by je) ani u neplatných čísel. Při změně rozložení iD se opravují selektory
 v objektu `SEL` ve skriptu.
 

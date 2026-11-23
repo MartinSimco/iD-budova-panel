@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iD – panel Budova (střechy, výšky, podlaží)
 // @namespace    osm-edit-budovy
-// @version      1.1.1
+// @version      1.2.0
 // @author       MartinSimco
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/MartinSimco/iD-budova-panel
@@ -9,7 +9,7 @@
 // (updateURL/downloadURL: Tampermonkey odtud sám stahuje nové verze)
 // @updateURL    https://raw.githubusercontent.com/MartinSimco/iD-budova-panel/main/budova-panel.user.js
 // @downloadURL  https://raw.githubusercontent.com/MartinSimco/iD-budova-panel/main/budova-panel.user.js
-// @description  Vizuální panel pro 3D atributy budov v editoru iD na openstreetmap.org: boční řez s kótami, výběr tvaru střechy obrázky, podlaží, barvy, materiály a upozornění.
+// @description  Vizuální panel pro 3D atributy budov v editoru iD na openstreetmap.org: boční řez s kótami, předvolby typů budov (panelák, rodinný dům, hala …), tvar a sklon střechy, podlaží, dopočet výšky, barvy, materiály, bez oken, průjezdy a upozornění.
 // @match        https://www.openstreetmap.org/id*
 // @run-at       document-idle
 // @grant        GM_addStyle
@@ -444,32 +444,31 @@
 
   // Zapíše kompletní novou sadu značek. iD si samo spočítá rozdíl proti stávajícím
   // značkám a provede ho jako jednu úpravu (jeden krok Zpět).
-  function zapisZnacky(noveTags) {
+  function zapisZnacky(noveTags, hromadne) {
     const ta = najdiTextarea();
     if (!ta) return false;
-    const duvod = duvodNezapsat(ta.value);           // pojistka proti nechtěné změně jiných značek
+    const duvod = duvodNezapsat(ta.value, hromadne); // pojistka proti nechtěné změně jiných značek
     if (duvod) { zobrazZpravu(duvod); return false; }
     ta.value = serializeTags(noveTags);
     ta.dispatchEvent(new Event('change'));            // na "change" iD reaguje funkcí textChanged
     return true;
   }
 
-  // ID vybraného prvku z adresy (iD tam píše např. "id=w357664858").
-  // Při výběru více prvků je tam "id=w1,w2" → vracíme null (hodnoty by se míchaly).
-  function vybranaId() {
+  // Výběr z adresy: iD tam píše "id=w357664858", při výběru více prvků "id=w1,w2,…".
+  // Vrací { id: celý text výběru nebo null, pocet: kolik prvků je vybráno }.
+  function vyberInfo() {
     const m = location.hash.match(/[#&]id=([^&]*)/);
-    if (!m) return null;
-    const id = decodeURIComponent(m[1]);
-    return id && !id.includes(',') ? id : null;
+    const id = m ? decodeURIComponent(m[1]) : '';
+    return id ? { id, pocet: id.split(',').length } : { id: null, pocet: 0 };
   }
 
-  // Volá callback(id), kdykoliv se v bočním panelu něco změní (výběr, přerenderování,
+  // Volá callback(vyberInfo()), kdykoliv se v bočním panelu něco změní (výběr, přerenderování,
   // úprava značek). Změna hodnoty textového pole není změna DOM, proto posloucháme
   // i události input/change. Debounce 150 ms: iD při překreslení mění DOM mnohokrát
   // za sebou, stačí nám zareagovat jednou, až se uklidní.
   function sledujVyber(callback) {
     let casovac = null;
-    const naplanuj = () => { clearTimeout(casovac); casovac = setTimeout(() => callback(vybranaId()), 150); };
+    const naplanuj = () => { clearTimeout(casovac); casovac = setTimeout(() => callback(vyberInfo()), 150); };
     const napoj = () => {
       const sidebar = document.querySelector(SEL.sidebar);
       if (!sidebar) { setTimeout(napoj, 500); return; } // iD se ještě nenačetl → zkusit později
@@ -515,6 +514,13 @@
     #budova-panel details { margin-top: 8px; }
     #budova-panel .bp-zprava { margin-bottom: 8px; padding: 6px 8px; background: #fdecea; border-left: 3px solid #d32f2f; color: #8a1c1c; }
     #budova-panel select { max-width: 170px; }
+    #budova-panel .bp-typy { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; }
+    #budova-panel .bp-typy button, #budova-panel .bp-smery button { height: auto; padding: 4px; font-size: 11px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }
+    #budova-panel .bp-typy button.bp-navrh { border: 2px solid #2e9d4b; background: #eaf7ee; }
+    #budova-panel .bp-smery { display: inline-grid; grid-template-columns: repeat(8, auto); gap: 2px; }
+    #budova-panel .bp-smery button { min-width: 0; padding: 2px 5px; }
+    #budova-panel .bp-smery button.bp-aktivni { border: 2px solid #2b7bd6; background: #e8f1fc; font-weight: bold; }
+    #budova-panel .bp-info { color: #555; font-size: 11px; }
   `;
 
   // Popisky polí pro výšky (pořadí = pořadí v panelu) a podlaží.
@@ -526,8 +532,44 @@
   const PODLAZI = [
     { klic: 'building:levels', label: 'Podlaží', napoveda: 'nad zemí, bez střechy' },
     { klic: 'roof:levels', label: 'Podlaží ve střeše', napoveda: 'obytné podkroví' },
-    { klic: 'building:min_level', label: 'Začíná od podlaží', napoveda: 'jen u částí budovy', jenCast: true }
+    { klic: 'building:min_level', label: 'Začíná od podlaží', napoveda: 'jen u částí budovy', jenCast: true },
+    { klic: 'building:levels:underground', label: 'Podzemní podlaží', napoveda: 'sklepy, podzemní garáže' }
   ];
+
+  // Tlačítka předvoleb typů budov. navrh = id typu, který panel zvýrazní (podle značek).
+  // Kostel nemá hodnoty – jen otevře návod na části budovy (věže, loď).
+  function htmlTypu(navrh) {
+    let h = `<div class="bp-typy">`;
+    for (const p of PREDVOLBY) {
+      h += `<button type="button" class="${p.id === navrh ? 'bp-navrh' : ''}" data-akce="typ" data-hodnota="${p.id}" ` +
+        `title="Doplní jen prázdné hodnoty${p.id === navrh ? ' – podle značek to vypadá na tento typ' : ''}">${p.label}</button>`;
+    }
+    return h + `<button type="button" data-akce="kostel" title="Kostely se skládají z částí – otevře návod">Kostel</button></div>`;
+  }
+
+  // Přepínač „bez oken“ (window=no). Při hromadném výběru se smíšenou hodnotou ("*")
+  // je nezaškrtnutý – zaškrtnutí pak zapíše window=no všem vybraným.
+  function htmlOkna(tags) {
+    return `<div class="bp-radek"><label><input type="checkbox" class="bp-okna"${bezOken(tags) ? ' checked' : ''}> Bez oken</label>` +
+      `<span class="bp-klic">window=no – sklady, trafostanice, garáže; 3D mapy pak nekreslí okna</span></div>`;
+  }
+
+  // Zúžený panel při výběru více budov: jen to, co jde bezpečně zapsat všem najednou.
+  function htmlHromadne(tags, pocet) {
+    let h = `<h3>🏘 Vybráno ${pocet} prvků</h3>`;
+    if (!tags.building || tags.building === '*') {
+      // Smíšené building= (nebo nejsou všechno budovy) – nevíme, jestli by se střecha
+      // nezapsala třeba i silnici, proto nic nenabízet.
+      return h + `<div class="bp-info">Hromadné předvolby fungují jen pro budovy se <b>stejnou</b> hodnotou building= ` +
+        `(teď ${tags.building ? 'se liší' : 'chybí'}). Vyber jen budovy jednoho typu.</div>`;
+    }
+    h += `<div class="bp-sekce"><b>Typ budovy</b> <span class="bp-info">doplní všem vybraným jen značky, které nemá žádná z nich; výšku hromadně nepočítá</span>${htmlTypu(navrhTypu(tags))}</div>`;
+    h += `<div class="bp-sekce">${htmlOkna(tags)}</div>`;
+    return h;
+  }
+
+  // Výchozí výška patra pro dopočet: podle zvýrazněného typu, jinak 3 m.
+  const vychoziPatro = tags => (PREDVOLBY.find(p => p.id === navrhTypu(tags)) || { patro: 3 }).patro;
 
   // Jedno ikonové tlačítko tvaru střechy (malé SVG se stejným obrysem jako v řezu).
   function ikonaStrechy(tvar) {
@@ -541,6 +583,11 @@
     const nazev = tags.name ? ' – ' + esc(tags.name) : '';
     let h = `<h3>🏠 ${jeCast ? 'Část budovy' : 'Budova'}${nazev}</h3>`;
 
+    // Předvolby typů (jen u celé budovy – části mají vlastní logiku: věže, průjezdy)
+    if (!jeCast) {
+      h += `<div class="bp-sekce"><b>Typ budovy</b> <span class="bp-info">doplní jen prázdné hodnoty – ověř je na ortofotu</span>${htmlTypu(navrhTypu(tags))}</div>`;
+    }
+
     // Boční řez + pole výšek (klik na kótu v řezu zaměří odpovídající pole)
     h += svgRez(tags);
     h += `<div class="bp-sekce"><b>Výšky</b>`;
@@ -550,6 +597,13 @@
         `<input class="bp-cislo" data-klic="${v.klic}" value="${esc(tags[v.klic] || '')}" placeholder="?"> m ` +
         `<span class="bp-klic">${v.klic} – ${v.napoveda}</span></div>`;
     }
+    // Dopočet výšky z podlaží. Pole „výška patra“ NENÍ značka OSM – jen vstup do výpočtu
+    // (proto nemá data-klic a onZmena ho nezapisuje).
+    const patroZDat = vyskaPatra(tags);
+    h += `<div class="bp-radek"><label>Výška patra</label>` +
+      `<input class="bp-cislo bp-patro" value="${vychoziPatro(tags)}"> m ` +
+      `<button type="button" data-akce="vyska" title="height = podlaží × výška patra + výška střechy (přepíše height)">Dopočítat výšku</button>` +
+      `<span class="bp-info">${patroZDat !== null ? 'z dat vychází ' + esc(zaokrouhli(patroZDat)) + ' m na patro' : 'jen pomůcka pro výpočet, do OSM se nezapisuje'}</span></div>`;
     h += `</div>`;
 
     // Tvar střechy – mřížka obrázkových tlačítek
@@ -558,7 +612,23 @@
       const aktivni = tags['roof:shape'] === r.value ? ' bp-aktivni' : '';
       h += `<button type="button" class="${aktivni}" data-akce="strecha" data-hodnota="${r.value}" title="roof:shape=${r.value}">${ikonaStrechy(r.value)}${r.label}</button>`;
     }
-    h += `</div></div>`;
+    h += `</div>`;
+    // Sklon (alternativa k roof:height) – u ploché střechy nemá smysl
+    if (tags['roof:shape'] && tags['roof:shape'] !== 'flat') {
+      h += `<div class="bp-radek"><label>Sklon střechy</label>` +
+        `<input class="bp-cislo" data-klic="roof:angle" value="${esc(tags['roof:angle'] || '')}" placeholder="?"> ° ` +
+        `<span class="bp-klic">roof:angle – stačí zadat buď sklon, nebo výšku střechy</span></div>`;
+    }
+    // Směr spádu – jen u pultové střechy (u ostatních tvarů určuje hřeben roof:orientation)
+    if (tags['roof:shape'] === 'skillion') {
+      const ted = smerNaStupne(tags['roof:direction'] || '');
+      h += `<div class="bp-radek"><label>Spád střechy k</label><span class="bp-smery">`;
+      for (const s of SMERY) {
+        h += `<button type="button" class="${ted === s.deg ? 'bp-aktivni' : ''}" data-akce="smer" data-hodnota="${s.deg}" title="roof:direction=${s.deg}">${s.label}</button>`;
+      }
+      h += `</span><span class="bp-klic">roof:direction – kam stéká voda</span></div>`;
+    }
+    h += `</div>`;
 
     // Podlaží – tlačítka −/+
     h += `<div class="bp-sekce"><b>Podlaží</b>`;
@@ -592,7 +662,7 @@
       if (ma && !seznam.some(m => m.value === ma)) opt += `<option value="${esc(ma)}" selected>${esc(ma)}</option>`; // zachovat neznámou hodnotu
       h += `<div class="bp-radek"><label>${label}</label><select data-klic="${klic}">${opt}</select><span class="bp-klic">${klic}</span></div>`;
     }
-    h += `</div>`;
+    h += htmlOkna(tags) + `</div>`;
 
     // Upozornění (jen informují)
     const upoz = checkWarnings(tags);
@@ -606,7 +676,15 @@
     if (jeCast && !tags['roof:shape']) {
       h += `<div class="bp-sekce"><button type="button" data-akce="vez">Předvyplnit jako věž (roof:shape=pyramidal)</button></div>`;
     }
-    h += `<details><summary>Jak namapovat věž nebo jinou část budovy</summary>` +
+    if (jeCast) {
+      h += `<div class="bp-sekce"><button type="button" data-akce="prujezd" title="doplní min_height=4 a building:min_level=1 (jen prázdné)">Část nad průjezdem</button></div>`;
+    }
+    h += `<details><summary>Jak udělat průjezd budovou</summary>` +
+      `<ol><li>Nástrojem <b>Plocha</b> obkresli zvlášť část budovy <b>nad průjezdem</b> a zvlášť zbytek budovy – obě jako <b>Část budovy</b>.</li>` +
+      `<li>U části nad průjezdem klikni na <b>Část nad průjezdem</b> (spodní hrana 4 m, od 1. patra) a nastav výšku.</li>` +
+      `<li>Na silnici nebo chodník, který vede pod budovou, rozděl cestu na okrajích budovy a úseku pod ní dej <b>tunnel=building_passage</b>.</li>` +
+      `<li>Obrys budovy nech celý – 3D renderery kreslí jen části, 2D mapy obrys.</li></ol></details>`;
+    h += `<details class="bp-vez"><summary>Jak namapovat věž nebo jinou část budovy</summary>` +
       `<ol><li>Nástrojem <b>Plocha</b> obkresli půdorys věže (uvnitř obrysu budovy).</li>` +
       `<li>Jako typ zvol <b>Část budovy</b> (building:part).</li>` +
       `<li>V tomto panelu nastav výšku věže (height = až po špičku), střechu a případně spodní hranu (min_height), když věž nezačíná na zemi.</li>` +
@@ -616,10 +694,12 @@
 
   // Provede změnu z panelu: přečte aktuální značky (mohly se mezitím změnit v iD),
   // přidá změnu a zapíše vše najednou → v iD vznikne jeden krok Zpět.
-  function zapis(changes) {
+  // hromadne = vybráno víc prvků (řádky "klíč=*" se zachovají a iD je přeskočí).
+  function zapis(changes, hromadne) {
     const tags = nactiZnacky();
     if (!tags) return;
-    zapisZnacky(applyChanges(tags, changes));
+    if (!Object.keys(changes).length) { zobrazZpravu('Není co doplnit – vše už je vyplněné.'); return; }
+    zapisZnacky(applyChanges(tags, changes), hromadne);
   }
 
   // Reakce na kliky v panelu (jeden posluchač pro všechna tlačítka – "delegace událostí").
@@ -634,7 +714,25 @@
     if (!b) return;
     e.preventDefault();
     const tags = nactiZnacky() || {};
+    const hromadne = vyberInfo().pocet > 1;
     switch (b.dataset.akce) {
+      case 'typ': zapis(predvolbaZmeny(tags, b.dataset.hodnota, hromadne), hromadne); break;
+      case 'kostel': {                                            // jen otevřít návod na části
+        const d = document.querySelector('#budova-panel details.bp-vez');
+        if (d) { d.open = true; d.scrollIntoView({ block: 'nearest' }); }
+        else zobrazZpravu('Kostel se mapuje po částech: vyber jednu budovu a otevři návod „Jak namapovat věž“.');
+        break;
+      }
+      case 'vyska': {
+        const pole = document.querySelector('#budova-panel input.bp-patro');
+        const patro = Number(normalizeNumber(pole ? pole.value : ''));
+        const h = patro > 0 ? vypoctiVysku(tags, patro) : null;
+        if (h === null) { zobrazZpravu('Výšku nespočítám: potřebuji celé číslo podlaží, výšku patra a u šikmé střechy i výšku střechy (roof:height).'); break; }
+        zapis({ height: h });
+        break;
+      }
+      case 'smer': zapis({ 'roof:direction': b.dataset.hodnota }); break;
+      case 'prujezd': zapis(zmenyPrujezd(tags)); break;
       case 'strecha': zapis({ 'roof:shape': b.dataset.hodnota }); break;
       case 'barva': zapis({ [b.dataset.klic]: b.dataset.hodnota }); break;
       case 'vez': if (!tags['roof:shape']) zapis({ 'roof:shape': 'pyramidal' }); break;
@@ -651,6 +749,12 @@
   // Reakce na změnu polí (číslo po Enter/opuštění pole, barva, materiál).
   function onZmena(e) {
     const el = e.target;
+    if (el.classList && el.classList.contains('bp-okna')) {        // přepínač Bez oken
+      e.stopPropagation();
+      const hromadne = vyberInfo().pocet > 1;
+      zapis(zmenyOkna(nactiZnacky() || {}, el.checked), hromadne);
+      return;
+    }
     if (!el.dataset || !el.dataset.klic) return;
     e.stopPropagation();                       // nepouštět dál do iD (není to jeho pole)
     if (el.classList.contains('bp-cislo')) {
@@ -666,18 +770,20 @@
   let posledniKlic = null;                     // id + značky posledního vykreslení
 
   // Zobrazí / aktualizuje / skryje panel podle aktuálního výběru.
-  function obnovPanel(id) {
+  function obnovPanel(info) {
     const telo = document.querySelector(SEL.teloEditoru);
     const stary = document.getElementById('budova-panel');
     const skryj = () => { if (stary) stary.remove(); posledniKlic = null; };
-    if (!id || !telo) return skryj();
+    if (!info.id || !telo) return skryj();
+    const hromadne = info.pocet > 1;
     const ta = najdiTextarea();
     if (!ta || ta.readOnly) return skryj();    // náhled při najetí myší je jen pro čtení
     const tags = parseTagText(ta.value);
     if (!tags.building && !tags['building:part']) return skryj();
-    if (Object.values(tags).includes('*')) return skryj(); // výběr více prvků se smíšenými hodnotami
+    // Jeden prvek se "*" by byl nesmysl (ručně napsaná hodnota "*") → panel nezobrazovat.
+    if (!hromadne && Object.values(tags).includes('*')) return skryj();
 
-    const klic = id + '|' + ta.value;
+    const klic = info.id + '|' + ta.value;
     if (stary && stary.parentNode === telo && klic === posledniKlic) return; // nic se nezměnilo
     if (stary && stary.contains(document.activeElement) && document.activeElement.tagName === 'INPUT' && document.activeElement.type !== 'color') return; // uživatel právě píše
 
@@ -692,9 +798,9 @@
       panel.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.classList.contains('bp-cislo')) e.target.blur(); });
       telo.prepend(panel);
     }
-    panel.innerHTML = htmlPanelu(tags);
+    panel.innerHTML = hromadne ? htmlHromadne(tags, info.pocet) : htmlPanelu(tags);
     // Značka s mezerou na okraji: upozornit hned, ne až když zápis odmítne
-    const duvod = duvodNezapsat(ta.value);
+    const duvod = duvodNezapsat(ta.value, hromadne);
     if (duvod) zobrazZpravu(duvod);
     posledniKlic = klic;
   }
