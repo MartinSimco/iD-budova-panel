@@ -152,6 +152,13 @@
     }
     if (tags['building:levels'] === '1' && !isNaN(h) && h >= 15) {
       w.push({ key: 'building:levels', text: '1 podlaží při výšce ' + h + ' m – možná pozůstatek importu z RÚIAN (u kostelů s jednou vysokou lodí to ale může sedět).' });
+    } else {
+      // Výška jednoho patra z dat (height − střecha) / podlaží. Běžné patro má 2,5–4 m,
+      // haly a obchody víc; mimo 2,2–6 m jde skoro jistě o překlep nebo starý import.
+      const patro = vyskaPatra(tags);
+      if (patro !== null && (patro < 2.2 || patro > 6)) {
+        w.push({ key: 'building:levels', text: 'Vychází ' + zaokrouhli(patro) + ' m na jedno podlaží – zkontroluj height a building:levels (běžné patro má 2,5–4 m).' });
+      }
     }
     // Desetinná čárka v datech: OSM vyžaduje tečku, renderery "7,5" nepřečtou
     // (panel by ji sám kreslil jako 7.5 a chyba by nebyla vidět – proto upozornit).
@@ -163,6 +170,121 @@
     return w;
   }
 
+  /* ---------------- v1.2: předvolby typů budov a další 3D značky ---------------- */
+
+  // Číslo → text pro OSM s nejvýš 1 desetinným místem ("22.4", "10", ne "22.400000001").
+  const zaokrouhli = n => String(Math.round(n * 10) / 10);
+
+  // Typické budovy. Hodnoty jsou ODHAD pro „běžnou“ českou stavbu – panel je doplní jen
+  // tam, kde v datech nic není, a uživatel je má ověřit na ortofotu. Úpravy a nové typy
+  // se dělají přímo tady (každý řádek = jedno tlačítko v panelu).
+  //   building   – na co změnit building=yes (jiný typ se nepřepisuje)
+  //   znacky     – značky, které se doplní, když chybí
+  //   patro      – typická výška jednoho podlaží (m) pro dopočet height
+  //   roofHeight – typická výška šikmé střechy (m); u ploché se nezadává
+  const PREDVOLBY = [
+    { id: 'panelak', label: 'Panelák', building: 'apartments', znacky: { 'roof:shape': 'flat' }, patro: 2.8 },
+    { id: 'cihlovy', label: 'Cihlový bytový dům', building: 'apartments', znacky: { 'roof:shape': 'hipped', 'roof:material': 'roof_tiles', 'roof:colour': '#b5482f' }, patro: 3.3, roofHeight: 4 },
+    { id: 'rodinny', label: 'Rodinný dům', building: 'house', znacky: { 'roof:shape': 'gabled', 'roof:material': 'roof_tiles', 'roof:colour': '#b5482f' }, patro: 3, roofHeight: 4 },
+    { id: 'radovy', label: 'Řadový dům', building: 'terrace', znacky: { 'roof:shape': 'gabled', 'roof:material': 'roof_tiles', 'roof:colour': '#b5482f' }, patro: 3, roofHeight: 3.5 },
+    { id: 'obchod', label: 'Obchodní centrum', building: 'retail', znacky: { 'roof:shape': 'flat' }, patro: 6 },
+    { id: 'hala', label: 'Hala / sklad', building: 'industrial', znacky: { 'roof:shape': 'flat', 'roof:material': 'metal' }, patro: 7 },
+    { id: 'garaze', label: 'Garáže', building: 'garages', znacky: { 'roof:shape': 'flat', window: 'no' }, patro: 2.5 }
+  ];
+
+  // Je hodnota „prázdná“ = může ji předvolba doplnit? '*' NENÍ prázdná: znamená, že ji
+  // aspoň část vybraných budov má (hromadný výběr) → nesahat.
+  const prazdne = v => v === undefined || v === '';
+
+  // Výška střechy pro výpočty: zadaná roof:height, u ploché (nebo nezadané) střechy 0,
+  // u šikmé bez roof:height null = nevíme (výpočet by byl nepravdivý).
+  function vyskaStrechy(tags) {
+    const rh = cislo(tags['roof:height']);
+    if (!isNaN(rh)) return rh;
+    const tvar = tags['roof:shape'];
+    return !tvar || tvar === 'flat' ? 0 : null;
+  }
+
+  // height = podlaží × výška patra + střecha. Vrací text k zápisu, nebo null, když
+  // podlaží nejsou celé číslo > 0 nebo neznáme výšku šikmé střechy.
+  function vypoctiVysku(tags, patro) {
+    if (!/^\d+$/.test(tags['building:levels'] || '') || Number(tags['building:levels']) < 1) return null;
+    const rh = vyskaStrechy(tags);
+    if (rh === null || !(patro > 0)) return null;
+    return zaokrouhli(Number(tags['building:levels']) * patro + rh);
+  }
+
+  // Skutečná výška jednoho patra podle dat, nebo null (chybí údaje / 0 podlaží).
+  function vyskaPatra(tags) {
+    const h = cislo(tags.height), lv = cislo(tags['building:levels']), rh = vyskaStrechy(tags);
+    if (isNaN(h) || !(lv > 0) || rh === null) return null;
+    return (h - rh) / lv;
+  }
+
+  // Změny, které udělá předvolba `id`. hromadne = vybráno víc budov → výšku nepočítat
+  // (každá má jiná podlaží a do všech by se zapsala stejná).
+  function predvolbaZmeny(tags, id, hromadne) {
+    const p = PREDVOLBY.find(x => x.id === id);
+    if (!p) return {};
+    const zmeny = {};
+    if (tags.building === 'yes' && p.building) zmeny.building = p.building;      // jen obecné "yes"
+    for (const [klic, hodnota] of Object.entries(p.znacky)) {
+      if (prazdne(tags[klic])) zmeny[klic] = hodnota;
+    }
+    const tvar = tags['roof:shape'] || zmeny['roof:shape'];
+    if (p.roofHeight && tvar && tvar !== 'flat' && prazdne(tags['roof:height'])) zmeny['roof:height'] = String(p.roofHeight);
+    if (!hromadne && prazdne(tags.height)) {
+      const h = vypoctiVysku(Object.assign({}, tags, zmeny), p.patro);
+      if (h !== null) zmeny.height = h;
+    }
+    return zmeny;
+  }
+
+  // Který typ budovy to nejspíš je (jen ZVÝRAZNĚNÍ tlačítka – nic se nezapisuje).
+  function navrhTypu(tags) {
+    const b = tags.building, lv = cislo(tags['building:levels']);
+    if (b === 'apartments') return lv >= 5 ? 'panelak' : (lv > 0 ? 'cihlovy' : null);
+    if (b === 'house' || b === 'detached' || b === 'semidetached_house') return 'rodinny';
+    if (b === 'terrace') return 'radovy';
+    if (b === 'retail' || b === 'supermarket' || b === 'commercial') return 'obchod';
+    if (b === 'industrial' || b === 'warehouse') return 'hala';
+    if (b === 'garages' || b === 'garage') return 'garaze';
+    return null;
+  }
+
+  // Směr spádu pultové střechy (roof:direction) – kam se střecha „dívá“ (ve směru stékání vody).
+  const SMERY = [
+    { label: 'S', deg: 0 }, { label: 'SV', deg: 45 }, { label: 'V', deg: 90 }, { label: 'JV', deg: 135 },
+    { label: 'J', deg: 180 }, { label: 'JZ', deg: 225 }, { label: 'Z', deg: 270 }, { label: 'SZ', deg: 315 }
+  ];
+  // OSM povoluje stupně i zkratky světových stran (anglicky, 16 směrů) → stupně, jinak null.
+  function smerNaStupne(v) {
+    const ANGL = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+    const i = ANGL.indexOf(String(v).toUpperCase());
+    if (i >= 0) return i * 22.5;
+    const n = Number(v);
+    return v !== '' && !isNaN(n) && n >= 0 && n <= 360 ? n : null;
+  }
+
+  // Budova bez oken: běžnější je window=no, méně často windows=no – uznáváme obojí.
+  const bezOken = tags => tags.window === 'no' || tags.windows === 'no';
+  // Zapnout → window=no; vypnout → smazat obě varianty "no" (jiné hodnoty window nechat).
+  function zmenyOkna(tags, zapnout) {
+    if (zapnout) return { window: 'no' };
+    const z = {};
+    if (tags.window === 'no') z.window = undefined;
+    if (tags.windows === 'no') z.windows = undefined;
+    return z;
+  }
+
+  // Část budovy nad průjezdem: začíná nad průjezdem (typicky 4 m, tj. nad přízemím).
+  function zmenyPrujezd(tags) {
+    const z = {};
+    if (prazdne(tags.min_height)) z.min_height = '4';
+    if (prazdne(tags['building:min_level'])) z['building:min_level'] = '1';
+    return z;
+  }
+
   // Kontrola PŘED zápisem: vrátí důvod, proč panel nesmí zapsat, nebo null.
   // Panel přepisuje celý text značek, takže cokoliv, co by se při převodu změnilo,
   // by změnil i bez vědomí uživatele:
@@ -170,7 +292,9 @@
   //    na kterou uživatel nesáhl (iD ořezává stejně, takže se to nedá obejít);
   //  - hodnota "*": iD tak ukazuje smíšené hodnoty při výběru více prvků → zápis by
   //    všem vybraným prvkům přepsal skutečné hodnoty (zjištěno revizí 2026-11-23).
-  function duvodNezapsat(text) {
+  //  - VÝJIMKA hromadne=true: iD neměněné řádky "klíč=*" při zápisu přeskočí (ověřeno ve
+  //    zdrojáku iD 2.42.3, raw_tag_editor.js → textChanged) → panel je jen nesmí vynechat.
+  function duvodNezapsat(text, hromadne) {
     for (const radek of String(text).split('\n')) {
       if (!radek.trim()) continue;                      // prázdné řádky nevadí
       const i = radek.indexOf('=');
@@ -179,7 +303,7 @@
       if (klic !== klic.trim() || hodnota !== hodnota.trim()) {
         return 'Značka „' + radek.trim() + '“ má mezeru na začátku nebo konci. Panel by ji při zápisu změnil, proto nic nezapíše – oprav ji nejdřív v iD.';
       }
-      if (hodnota === '*') {
+      if (hodnota === '*' && !hromadne) {
         return 'Je vybráno víc prvků s různými hodnotami (' + klic.trim() + '=*). Panel funguje jen pro jeden prvek.';
       }
     }
@@ -283,7 +407,8 @@
    * Export pro test v Node. V prohlížeči "module" neexistuje → přeskočí se
    * a pokračuje se spuštěním panelu na stránce.
    * ==================================================================== */
-  const API = { ROOF_SHAPES, MATERIALS_BUILDING, MATERIALS_ROOF, COLOURS, parseTagText, serializeTags, applyChanges, normalizeNumber, checkWarnings, svgRez, obrysStrechy, duvodNezapsat, krokPodlazi };
+  const API = { ROOF_SHAPES, MATERIALS_BUILDING, MATERIALS_ROOF, COLOURS, parseTagText, serializeTags, applyChanges, normalizeNumber, checkWarnings, svgRez, obrysStrechy, duvodNezapsat, krokPodlazi,
+    PREDVOLBY, SMERY, predvolbaZmeny, vypoctiVysku, vyskaPatra, navrhTypu, smerNaStupne, bezOken, zmenyOkna, zmenyPrujezd };
   if (typeof module === 'object' && module.exports) { module.exports = API; return; }
 
   /* ======================================================================

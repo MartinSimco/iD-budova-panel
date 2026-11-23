@@ -57,4 +57,67 @@ assert.strictEqual(L.krokPodlazi('1', -1, 'building:levels'), '0');      // buil
 assert.strictEqual(L.krokPodlazi('1', -1, 'roof:levels'), '');           // roof:levels 0 → smazat ('' = smazat)
 assert.strictEqual(L.krokPodlazi('0', -1, 'building:levels'), null);     // pod nulu ne
 
+// ======================= v1.2: předvolby typů a další 3D značky =======================
+
+// --- předvolby: doplní jen prázdné hodnoty, building změní jen z "yes" ---
+const pan = L.predvolbaZmeny({ building: 'yes', 'building:levels': '8' }, 'panelak', false);
+assert.strictEqual(pan.building, 'apartments');
+assert.strictEqual(pan['roof:shape'], 'flat');
+assert.strictEqual(pan.height, '22.4');                       // 8 × 2,8 m, plochá střecha bez výšky
+const rd = L.predvolbaZmeny({ building: 'house', 'building:levels': '2', 'roof:shape': 'hipped' }, 'rodinny', false);
+assert.ok(!('building' in rd));                               // house nepřepisovat
+assert.ok(!('roof:shape' in rd));                             // existující tvar nepřepisovat
+assert.strictEqual(rd['roof:height'], '4');                   // střecha není plochá → doplnit výšku střechy
+assert.strictEqual(rd.height, '10');                          // 2 × 3 + 4
+assert.ok(!('height' in L.predvolbaZmeny({ building: 'yes', height: '12', 'building:levels': '3' }, 'rodinny', false)));
+// hromadně: klíče se "*" nechat, výšku nepočítat (každá budova má jiná podlaží)
+const hrom = L.predvolbaZmeny({ building: 'yes', 'roof:shape': '*', 'building:levels': '*' }, 'panelak', true);
+assert.ok(!('roof:shape' in hrom) && !('height' in hrom));
+assert.strictEqual(hrom.building, 'apartments');
+assert.strictEqual(L.predvolbaZmeny({ building: 'garages' }, 'garaze', false).window, 'no');
+assert.deepStrictEqual(L.predvolbaZmeny({ building: 'yes' }, 'neexistuje', false), {});
+// část budovy: building se nedoplňuje
+assert.ok(!('building' in L.predvolbaZmeny({ 'building:part': 'yes' }, 'panelak', false)));
+
+// --- výška z podlaží a výška patra ---
+assert.strictEqual(L.vypoctiVysku({ 'building:levels': '4', 'roof:height': '3', 'roof:shape': 'gabled' }, 3), '15');
+assert.strictEqual(L.vypoctiVysku({ 'building:levels': '5' }, 2.8), '14');           // bez střechy = plochá
+assert.strictEqual(L.vypoctiVysku({ 'building:levels': '2', 'roof:shape': 'gabled' }, 3), null); // šikmá bez roof:height → nevím
+assert.strictEqual(L.vypoctiVysku({ 'building:levels': '2.5' }, 3), null);
+assert.strictEqual(L.vypoctiVysku({}, 3), null);
+assert.strictEqual(L.vyskaPatra({ height: '12', 'roof:height': '3', 'roof:shape': 'gabled', 'building:levels': '3' }), 3);
+assert.strictEqual(L.vyskaPatra({ height: '12', 'building:levels': '0' }), null);
+assert.ok(k({ building: 'yes', height: '30', 'building:levels': '3' }).includes('building:levels'));  // 10 m na patro
+assert.ok(k({ building: 'yes', height: '5', 'building:levels': '3' }).includes('building:levels'));   // 1,7 m na patro
+assert.deepStrictEqual(L.checkWarnings({ building: 'apartments', height: '24', 'building:levels': '8' }), []);
+
+// --- směr pultové střechy ---
+assert.strictEqual(L.smerNaStupne('90'), 90);
+assert.strictEqual(L.smerNaStupne('SW'), 225);
+assert.strictEqual(L.smerNaStupne('NNE'), 22.5);
+assert.strictEqual(L.smerNaStupne('blbost'), null);
+assert.strictEqual(L.SMERY.length, 8);
+
+// --- bez oken ---
+assert.strictEqual(L.bezOken({ windows: 'no' }), true);
+assert.strictEqual(L.bezOken({ window: 'yes' }), false);
+assert.deepStrictEqual(L.zmenyOkna({}, true), { window: 'no' });
+assert.deepStrictEqual(L.zmenyOkna({ window: 'no', windows: 'no' }, false), { window: undefined, windows: undefined });
+
+// --- návrh typu podle značek ---
+assert.strictEqual(L.navrhTypu({ building: 'apartments', 'building:levels': '6' }), 'panelak');
+assert.strictEqual(L.navrhTypu({ building: 'apartments', 'building:levels': '3' }), 'cihlovy');
+assert.strictEqual(L.navrhTypu({ building: 'detached' }), 'rodinny');
+assert.strictEqual(L.navrhTypu({ building: 'warehouse' }), 'hala');
+assert.strictEqual(L.navrhTypu({ building: 'yes' }), null);
+
+// --- část nad průjezdem: jen prázdné hodnoty ---
+assert.deepStrictEqual(L.zmenyPrujezd({ 'building:part': 'yes' }), { min_height: '4', 'building:min_level': '1' });
+assert.deepStrictEqual(L.zmenyPrujezd({ 'building:part': 'yes', min_height: '5' }), { 'building:min_level': '1' });
+
+// --- hromadný režim: "*" je povolená, mezery na okraji ne ---
+assert.strictEqual(L.duvodNezapsat('building=yes\nroof:shape=*', true), null);
+assert.ok(L.duvodNezapsat('building=yes\nroof:shape=*', false));
+assert.ok(L.duvodNezapsat('name= X', true));
+
 console.log('OK – všechny testy prošly');
