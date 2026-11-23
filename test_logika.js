@@ -120,4 +120,67 @@ assert.strictEqual(L.duvodNezapsat('building=yes\nroof:shape=*', true), null);
 assert.ok(L.duvodNezapsat('building=yes\nroof:shape=*', false));
 assert.ok(L.duvodNezapsat('name= X', true));
 
+// ======================= v1.3: živý 3D náhled a otočení střechy =======================
+
+// --- převod px → m: na rovníku při zoomu 0 má pixel ~156 km ---
+assert.ok(Math.abs(L.mNaPx(0, 0) - 156543.03) < 0.1);
+assert.ok(Math.abs(L.mNaPx(20, 60) - 156543.03 * 0.5 / 1048576) < 1e-6);
+
+// --- půdorys z SVG cesty: osa y míří na sever (v obrazovce dolů = na jih), poslední opakovaný bod pryč ---
+const pud = L.pudorysZCesty('M0,0L20,0L20,10L0,10Z', 0.5);
+assert.strictEqual(pud.length, 4);
+assert.deepStrictEqual(pud[2], [10, -5]);
+assert.strictEqual(L.pudorysZCesty('M0 0 L10 0 L10 10 L0 0', 1).length, 3);      // uzavření opakováním 1. bodu
+
+// --- nejmenší obdélník kolem půdorysu: rozměry a směr delší osy ---
+const ob = L.obdelnik([[0, 0], [10, 0], [10, 4], [0, 4]]);
+assert.ok(Math.abs(ob.delka - 10) < 1e-6 && Math.abs(ob.sirka - 4) < 1e-6);
+assert.ok(Math.abs(Math.abs(ob.ux) - 1) < 1e-6);                                 // delší osa ve směru x
+const obS = L.obdelnik([[0, 0], [7, 7], [5, 9], [-2, 2]]);                       // natočený obdélník 45°
+assert.ok(Math.abs(obS.delka - Math.hypot(7, 7)) < 1e-6 && Math.abs(obS.sirka - Math.hypot(2, 2)) < 1e-6);
+
+// --- 3D model: sedlová střecha, hřeben podél/napříč (osa hřebene se prohodí) ---
+const dum = [[0, 0], [10, 0], [10, 4], [0, 4]];
+const hreben = m => {                                                             // body ve výšce vrcholu → rozsah v x a y
+  const v = m.plochy.flatMap(f => f.body).filter(b => Math.abs(b[2] - 8) < 1e-6);
+  return [Math.max(...v.map(b => b[0])) - Math.min(...v.map(b => b[0])), Math.max(...v.map(b => b[1])) - Math.min(...v.map(b => b[1]))];
+};
+const podel = L.model3d({ building: 'house', height: '8', 'roof:height': '3', 'roof:shape': 'gabled' }, dum);
+const napric = L.model3d({ building: 'house', height: '8', 'roof:height': '3', 'roof:shape': 'gabled', 'roof:orientation': 'across' }, dum);
+assert.ok(hreben(podel)[0] > 9 && hreben(podel)[1] < 1e-6);                      // hřeben 10 m podél x
+assert.ok(hreben(napric)[1] > 3.9 && hreben(napric)[0] < 1e-6);                  // hřeben 4 m podél y
+assert.strictEqual(podel.plochy.filter(f => f.druh === 'stena').length, 4);       // 4 stěny
+
+// --- pultová: nejníž na straně, kam stéká voda (roof:direction=180 = na jih = malé y) ---
+const pult = L.model3d({ building: 'yes', height: '6', 'roof:height': '2', 'roof:shape': 'skillion', 'roof:direction': '180' }, dum);
+const strecha = pult.plochy.find(f => f.druh === 'strecha');
+const zJih = Math.max(...strecha.body.filter(b => b[1] === 0).map(b => b[2]));
+const zSever = Math.min(...strecha.body.filter(b => b[1] === 4).map(b => b[2]));
+assert.ok(Math.abs(zJih - 4) < 1e-6 && Math.abs(zSever - 6) < 1e-6);
+
+// --- výška střechy ze sklonu (45° nad polovinou šířky 4 m = 2 m) a odhad výšky z podlaží ---
+const skl = L.model3d({ building: 'house', 'building:levels': '2', 'roof:angle': '45', 'roof:shape': 'gabled' }, dum);
+assert.ok(Math.abs(Math.max(...skl.plochy.flatMap(f => f.body).map(b => b[2])) - 8) < 1e-6);   // 2×3 + 2
+assert.ok(skl.poznamky.some(t => /odhad/.test(t)));
+// jehlan a kopule: vrchol nad středem půdorysu, výška = height
+const jeh = L.model3d({ building: 'yes', height: '10', 'roof:height': '4', 'roof:shape': 'pyramidal' }, dum);
+assert.ok(jeh.plochy.flatMap(f => f.body).some(b => Math.abs(b[0] - 5) < 1e-6 && Math.abs(b[1] - 2) < 1e-6 && Math.abs(b[2] - 10) < 1e-6));
+const kop = L.model3d({ building: 'yes', height: '10', 'roof:height': '4', 'roof:shape': 'dome' }, dum);
+assert.ok(Math.abs(Math.max(...kop.plochy.flatMap(f => f.body).map(b => b[2])) - 10) < 1e-6);
+// spodní hrana: stěny začínají v min_height
+const most = L.model3d({ 'building:part': 'yes', height: '9', min_height: '4' }, dum);
+assert.ok(Math.min(...most.plochy.flatMap(f => f.body).map(b => b[2])) === 4);
+
+// --- SVG: polygony, žádný neošetřený text z dat ---
+const s3 = L.svg3d([podel], 30);
+assert.ok(s3.startsWith('<svg') && (s3.match(/<polygon/g) || []).length >= 8);
+assert.ok(!L.svg3d([L.model3d({ building: 'yes', height: '5', 'building:colour': '"><script>' }, dum)], 0).includes('<script>'));
+assert.ok(L.svg3d([], 0).includes('<svg'));                                       // prázdný model nespadne
+
+// --- otočení pultové střechy o 180° ---
+assert.deepStrictEqual(L.otocO180({ 'roof:direction': '90' }), { 'roof:direction': '270' });
+assert.deepStrictEqual(L.otocO180({ 'roof:direction': 'NW' }), { 'roof:direction': '135' });
+assert.deepStrictEqual(L.otocO180({}), {});
+assert.ok(L.ORIENTOVATELNE.includes('gabled') && !L.ORIENTOVATELNE.includes('skillion'));
+
 console.log('OK – všechny testy prošly');

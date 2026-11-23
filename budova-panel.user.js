@@ -285,6 +285,228 @@
     return z;
   }
 
+  /* ---------------- v1.3: živý 3D náhled a otočení střechy ---------------- */
+
+  // Tvary, u kterých má smysl hřeben „podél / napříč“ (roof:orientation).
+  const ORIENTOVATELNE = ['gabled', 'hipped', 'half-hipped', 'gambrel', 'mansard', 'round'];
+
+  // Pultová střecha otočená o 180° (spád na opačnou stranu). Bez směru nevíme, odkud otáčet.
+  function otocO180(tags) {
+    const deg = smerNaStupne(tags['roof:direction'] || '');
+    return deg === null ? {} : { 'roof:direction': zaokrouhli((deg + 180) % 360) };
+  }
+
+  // Kolik metrů měří jeden pixel mapy (Web Mercator, dlaždice 256 px) při zoomu z
+  // a zeměpisné šířce lat. Na rovníku při z=0 je to obvod Země / 256 ≈ 156 543 m.
+  const mNaPx = (z, lat) => 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, z);
+
+  // Půdorys z atributu "d" SVG cesty, kterou iD kreslí v mapě: dvojice čísel = body v pixelech.
+  // Převedeme na metry; osa y v obrazovce míří dolů, my chceme y = sever (nahoru) → znaménko.
+  // Uzavřenou cestu (poslední bod = první) zkrátíme o opakovaný bod.
+  function pudorysZCesty(d, m) {
+    const c = String(d).match(/-?\d+(\.\d+)?(e-?\d+)?/gi) || [];
+    const pts = [];
+    for (let i = 0; i + 1 < c.length; i += 2) {
+      const p = [Number(c[i]) * m, -Number(c[i + 1]) * m || 0];      // "|| 0": z -0 udělat 0
+      const prev = pts[pts.length - 1];
+      if (!prev || Math.hypot(p[0] - prev[0], p[1] - prev[1]) > 1e-9) pts.push(p);
+    }
+    if (pts.length > 2 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-9) pts.pop();
+    return pts;
+  }
+
+  // Konvexní obal (Andrewův algoritmus) – nejmenší „gumička“ kolem bodů.
+  function konvexniObal(pts) {
+    const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const kriz = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const dol = [], hor = [];
+    for (const q of p) { while (dol.length >= 2 && kriz(dol[dol.length - 2], dol[dol.length - 1], q) <= 0) dol.pop(); dol.push(q); }
+    for (const q of p.reverse()) { while (hor.length >= 2 && kriz(hor[hor.length - 2], hor[hor.length - 1], q) <= 0) hor.pop(); hor.push(q); }
+    return dol.slice(0, -1).concat(hor.slice(0, -1));
+  }
+
+  // Nejmenší obdélník kolem půdorysu: jedna jeho strana vždy leží na hraně konvexního obalu,
+  // stačí tedy vyzkoušet všechny hrany obalu. Vrací střed, jednotkové osy (u = delší strana)
+  // a rozměry. Podle něj se určuje „delší strana“ budovy pro roof:orientation.
+  function obdelnik(pts) {
+    const obal = konvexniObal(pts);
+    let nej = null;
+    for (let i = 0; i < obal.length; i++) {
+      const a = obal[i], b = obal[(i + 1) % obal.length];
+      const del = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (del < 1e-9) continue;
+      const ux = (b[0] - a[0]) / del, uy = (b[1] - a[1]) / del, vx = -uy, vy = ux;
+      let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+      for (const q of obal) {
+        const u = q[0] * ux + q[1] * uy, v = q[0] * vx + q[1] * vy;
+        u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v);
+      }
+      const plocha = (u1 - u0) * (v1 - v0);
+      if (!nej || plocha < nej.plocha - 1e-9) nej = { plocha, ux, uy, vx, vy, u0, u1, v0, v1 };
+    }
+    if (!nej) return { cx: 0, cy: 0, ux: 1, uy: 0, vx: 0, vy: 1, delka: 0, sirka: 0 };
+    let { ux, uy, vx, vy } = nej, du = nej.u1 - nej.u0, dv = nej.v1 - nej.v0;
+    const su = (nej.u0 + nej.u1) / 2, sv = (nej.v0 + nej.v1) / 2;
+    const cx = su * ux + sv * vx, cy = su * uy + sv * vy;
+    if (dv > du) { [ux, uy, vx, vy] = [vx, vy, -ux, -uy]; [du, dv] = [dv, du]; }   // u = delší osa
+    return { cx, cy, ux, uy, vx, vy, delka: du, sirka: dv };
+  }
+
+  // Těžiště polygonu (plošně vážené); u degenerovaného polygonu průměr bodů.
+  function teziste(pts) {
+    let A = 0, x = 0, y = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % pts.length], c = x0 * y1 - x1 * y0;
+      A += c; x += (x0 + x1) * c; y += (y0 + y1) * c;
+    }
+    if (Math.abs(A) < 1e-9) return [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+    return [x / (3 * A), y / (3 * A)];
+  }
+
+  // 3D model budovy z půdorysu (metry, raději kolem počátku – kvůli přesnosti) a značek:
+  // seznam ploch {body:[[x,y,z]…], barva, druh}; druh: 'stena' (stěny po obvodu), 'stit'
+  // (štíty), 'strecha'. Poznámky = co bylo odhadnuto nebo zjednodušeno.
+  function model3d(tags, pts) {
+    const poznamky = [], plochy = [];
+    if (!pts || pts.length < 3) return { plochy, poznamky: ['půdorys není k dispozici'] };
+    const tvar = tags['roof:shape'] || 'flat';
+    const fasada = barvaKresleni(tags['building:colour'], '#e6e1d6');
+    const strecha = barvaKresleni(tags['roof:colour'], '#a5684a');
+    const MIN = Math.max(cislo(tags.min_height) || 0, 0);
+
+    // Osa hřebene: podél delší strany (výchozí), napříč, nebo kolmo na roof:direction
+    // (u čtverce „delší strana“ neexistuje – tam rozhoduje směr spádu).
+    const ob = obdelnik(pts);
+    let r = [ob.ux, ob.uy];
+    const smer = smerNaStupne(tags['roof:direction'] || '');
+    if (tags['roof:orientation'] === 'across') r = [ob.vx, ob.vy];
+    else if (tags['roof:orientation'] !== 'along' && smer !== null) {
+      const t = smer * Math.PI / 180; r = [Math.cos(t), -Math.sin(t)];            // kolmo na spád
+    }
+    const pv = [-r[1], r[0]];
+    // rozsah půdorysu v ose hřebene (u) a kolmo na ni (v)
+    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+    for (const p of pts) {
+      const u = p[0] * r[0] + p[1] * r[1], v = p[0] * pv[0] + p[1] * pv[1];
+      u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v);
+    }
+    const cu = (u0 + u1) / 2, cv = (v0 + v1) / 2, Lp = (u1 - u0) / 2, Sp = (v1 - v0) / 2;
+    const bod = (u, v, z) => [(cu + u) * r[0] + (cv + v) * pv[0], (cu + u) * r[1] + (cv + v) * pv[1], z];
+
+    // Spád pultové střechy: voda stéká ve směru d (od severu po směru hodin; x = východ, y = sever).
+    const ds = smer === null ? Math.PI : smer * Math.PI / 180;                    // bez směru: na jih
+    const dvec = [Math.sin(ds), Math.cos(ds)];
+    const sp = pts.map(p => p[0] * dvec[0] + p[1] * dvec[1]);
+    const sMin = Math.min(...sp), sMax = Math.max(...sp);
+
+    // Výšky: střecha ze značky, ze sklonu, nebo odhad; celková výška ze značky, z podlaží, nebo 10 m.
+    let RH = cislo(tags['roof:height']);
+    const uhel = cislo(tags['roof:angle']);
+    if (isNaN(RH) && tvar !== 'flat' && uhel > 0 && uhel < 90) {
+      const rozpeti = tvar === 'skillion' ? (sMax - sMin) : (ORIENTOVATELNE.includes(tvar) ? Sp : ob.sirka / 2);
+      RH = Math.tan(uhel * Math.PI / 180) * rozpeti;
+    }
+    let H = cislo(tags.height);
+    if (isNaN(H)) {
+      const lv = cislo(tags['building:levels']);
+      if (lv > 0) { H = lv * 3 + (isNaN(RH) ? (tvar === 'flat' ? 0 : 3) : RH); poznamky.push('výška odhadnuta z podlaží (3 m na patro)'); }
+      else { H = 10; poznamky.push('výška odhadnuta (10 m) – zadej height'); }
+    }
+    if (isNaN(RH)) { RH = tvar === 'flat' ? 0 : Math.min(3, (H - MIN) * 0.3); if (tvar !== 'flat') poznamky.push('výška střechy odhadnuta'); }
+    RH = Math.min(Math.max(RH, 0), Math.max(H - MIN, 0));
+    const W = H - RH;                                                              // horní hrana stěn
+
+    // Horní hrana stěny v bodě i: u pultové stoupá od okapu (strana spádu) k vrcholu.
+    const zTop = i => tvar === 'skillion' && sMax > sMin ? W + RH * (sMax - sp[i]) / (sMax - sMin) : W;
+    for (let i = 0; i < pts.length; i++) {
+      const j = (i + 1) % pts.length, a = pts[i], b = pts[j];
+      plochy.push({ druh: 'stena', barva: fasada, body: [[a[0], a[1], MIN], [b[0], b[1], MIN], [b[0], b[1], zTop(j)], [a[0], a[1], zTop(i)]] });
+    }
+    const S = (body, druh) => plochy.push({ druh: druh || 'strecha', barva: druh === 'stit' ? fasada : strecha, body });
+    const c = teziste(pts);
+
+    if (tvar === 'flat' || tvar === 'skillion' || RH <= 0) {
+      S(pts.map((p, i) => [p[0], p[1], zTop(i)]));                                // rovina (vodorovná / šikmá)
+    } else if (tvar === 'pyramidal' || tvar === 'cone') {
+      for (let i = 0; i < pts.length; i++) { const a = pts[i], b = pts[(i + 1) % pts.length]; S([[a[0], a[1], W], [b[0], b[1], W], [c[0], c[1], H]]); }
+    } else if (tvar === 'dome' || tvar === 'onion') {
+      // Prstence od okapu k vrcholu; s = zmenšení ke středu, z = výška prstence.
+      const n = 6, prstence = [];
+      for (let k = 0; k <= n; k++) {
+        const t = k / n;
+        const s = tvar === 'dome' ? Math.cos(t * Math.PI / 2) : Math.pow(1 - t, 0.9) * (1 + 0.6 * Math.sin(Math.PI * t));
+        const z = tvar === 'dome' ? W + RH * Math.sin(t * Math.PI / 2) : W + RH * t;
+        prstence.push(pts.map(p => [c[0] + s * (p[0] - c[0]), c[1] + s * (p[1] - c[1]), z]));
+      }
+      for (let k = 0; k < n; k++) for (let i = 0; i < pts.length; i++) {
+        const j = (i + 1) % pts.length;
+        S([prstence[k][i], prstence[k][j], prstence[k + 1][j], prstence[k + 1][i]]);
+      }
+    } else if (tvar === 'round') {
+      // Válcová: oblouk napříč hřebenem (6 pásů) + čelní výseče
+      const n = 6, z = v => W + RH * Math.sqrt(Math.max(0, 1 - (v / Sp) * (v / Sp)));
+      const prurez = [];
+      for (let k = 0; k <= n; k++) { const v = -Sp + 2 * Sp * k / n; prurez.push([v, z(v)]); }
+      for (let k = 0; k < n; k++) S([bod(-Lp, prurez[k][0], prurez[k][1]), bod(Lp, prurez[k][0], prurez[k][1]), bod(Lp, prurez[k + 1][0], prurez[k + 1][1]), bod(-Lp, prurez[k + 1][0], prurez[k + 1][1])]);
+      for (const u of [-Lp, Lp]) S(prurez.map(([v, zz]) => bod(u, v, zz)), 'stit');
+    } else {
+      // Sedlová a valbová rodina nad obdélníkem: valba = o kolik je hřeben kratší na každém konci.
+      const valba = tvar === 'hipped' || tvar === 'mansard' ? Math.min(Sp, Lp) : (tvar === 'half-hipped' ? Math.min(Sp, Lp) * 0.5 : 0);
+      if (!['gabled', 'gambrel', 'hipped', 'mansard', 'half-hipped'].includes(tvar)) poznamky.push('tvar ' + tvar + ' kreslím zjednodušeně jako sedlový');
+      const hA = bod(-Lp + valba, 0, H), hB = bod(Lp - valba, 0, H);
+      S([bod(-Lp, -Sp, W), bod(Lp, -Sp, W), hB, hA]);                             // jedna strana
+      S([bod(Lp, Sp, W), bod(-Lp, Sp, W), hA, hB]);                               // druhá strana
+      if (valba > 0) { S([bod(Lp, -Sp, W), bod(Lp, Sp, W), hB]); S([bod(-Lp, Sp, W), bod(-Lp, -Sp, W), hA]); }
+      else { S([bod(Lp, -Sp, W), bod(Lp, Sp, W), hB], 'stit'); S([bod(-Lp, Sp, W), bod(-Lp, -Sp, W), hA], 'stit'); }
+      const plochaPud = Math.abs(pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2;
+      if (plochaPud < 0.85 * (4 * Lp * Sp)) poznamky.push('střecha zjednodušeně nad obdélníkem kolem půdorysu');
+    }
+    return { plochy, poznamky };
+  }
+
+  // Ztmavení barvy "#rrggbb"/"#rgb" koeficientem k (0–1) → "rgb(…)" pro stínování ploch.
+  function stin(hex, k) {
+    let h = hex.slice(1);
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
+    const n = parseInt(h, 16);
+    return `rgb(${[(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(v * k)).join(',')})`;
+  }
+
+  // Kresba modelů do SVG 300×200: otočení kolem svislé osy o azimut (°), pohled od jihu
+  // shora pod úhlem 35°. Plochy se kreslí odzadu dopředu („malířův algoritmus“) a tmavnou
+  // podle toho, jak se odvracejí od světla. Měřítko nezávisí na natočení (při otáčení nepulzuje).
+  function svg3d(modely, azimut) {
+    const plochy = modely.flatMap(m => m.plochy);
+    const hlava = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200" class="bp-3d-svg">';
+    if (!plochy.length) return hlava + '<text x="150" y="100" text-anchor="middle" font-size="11" fill="#777">bez půdorysu</text></svg>';
+    const vse = plochy.flatMap(f => f.body);
+    const x0 = (Math.min(...vse.map(b => b[0])) + Math.max(...vse.map(b => b[0]))) / 2;
+    const y0 = (Math.min(...vse.map(b => b[1])) + Math.max(...vse.map(b => b[1]))) / 2;
+    const R = Math.max(1, ...vse.map(b => Math.hypot(b[0] - x0, b[1] - y0)));
+    const Hm = Math.max(1, ...vse.map(b => b[2]));
+    const e = 35 * Math.PI / 180, ce = Math.cos(e), se = Math.sin(e);
+    const k = Math.min(280 / (2 * R), 180 / (2 * R * se + Hm * ce));
+    const a = azimut * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+    const rot = b => { const x = b[0] - x0, y = b[1] - y0; return [x * ca - y * sa, x * sa + y * ca, b[2]]; };
+    const svetlo = (() => { const v = [-0.4, -0.5, 0.75], d = Math.hypot(...v); return v.map(c => c / d); })();
+    const kresba = plochy.map(f => {
+      const b = f.body.map(rot);
+      // normála plochy z prvních bodů, které neleží na přímce
+      let n = [0, 0, 1];
+      for (let i = 2; i < b.length; i++) {
+        const u = [b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]], w = [b[i][0] - b[0][0], b[i][1] - b[0][1], b[i][2] - b[0][2]];
+        const c = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]], d = Math.hypot(...c);
+        if (d > 1e-9) { n = c.map(x => x / d); break; }
+      }
+      const jas = 0.55 + 0.45 * Math.abs(n[0] * svetlo[0] + n[1] * svetlo[1] + n[2] * svetlo[2]);
+      const hloubka = b.reduce((s, p) => s + p[1] * ce - p[2] * se, 0) / b.length;  // dál = větší
+      const body = b.map(p => (150 + p[0] * k).toFixed(1) + ',' + (190 - R * se * k - (p[2] * ce + p[1] * se) * k).toFixed(1)).join(' ');
+      return { hloubka, svg: `<polygon points="${body}" fill="${stin(f.barva, jas)}" stroke="#333" stroke-width="0.4" stroke-linejoin="round"/>` };
+    });
+    kresba.sort((p, q) => q.hloubka - p.hloubka);
+    return hlava + kresba.map(x => x.svg).join('') + '</svg>';
+  }
+
   // Kontrola PŘED zápisem: vrátí důvod, proč panel nesmí zapsat, nebo null.
   // Panel přepisuje celý text značek, takže cokoliv, co by se při převodu změnilo,
   // by změnil i bez vědomí uživatele:
@@ -408,7 +630,8 @@
    * a pokračuje se spuštěním panelu na stránce.
    * ==================================================================== */
   const API = { ROOF_SHAPES, MATERIALS_BUILDING, MATERIALS_ROOF, COLOURS, parseTagText, serializeTags, applyChanges, normalizeNumber, checkWarnings, svgRez, obrysStrechy, duvodNezapsat, krokPodlazi,
-    PREDVOLBY, SMERY, predvolbaZmeny, vypoctiVysku, vyskaPatra, navrhTypu, smerNaStupne, bezOken, zmenyOkna, zmenyPrujezd };
+    PREDVOLBY, SMERY, predvolbaZmeny, vypoctiVysku, vyskaPatra, navrhTypu, smerNaStupne, bezOken, zmenyOkna, zmenyPrujezd,
+    ORIENTOVATELNE, otocO180, mNaPx, pudorysZCesty, obdelnik, model3d, svg3d };
   if (typeof module === 'object' && module.exports) { module.exports = API; return; }
 
   /* ======================================================================
