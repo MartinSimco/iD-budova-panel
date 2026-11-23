@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iD – panel Budova (střechy, výšky, podlaží)
 // @namespace    osm-edit-budovy
-// @version      1.2.0
+// @version      1.2.1
 // @author       MartinSimco
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/MartinSimco/iD-budova-panel
@@ -521,6 +521,8 @@
     #budova-panel .bp-smery button { min-width: 0; padding: 2px 5px; }
     #budova-panel .bp-smery button.bp-aktivni { border: 2px solid #2b7bd6; background: #e8f1fc; font-weight: bold; }
     #budova-panel .bp-info { color: #555; font-size: 11px; }
+    /* samostatná tlačítka (Dopočítat výšku, Část nad průjezdem, věž) – iD by z nich udělalo holý text */
+    #budova-panel button.bp-tl { height: auto; min-width: 0; padding: 3px 8px; font-size: 11px; color: #2b7bd6; background: #fff; border: 1px solid #2b7bd6; border-radius: 4px; }
   `;
 
   // Popisky polí pro výšky (pořadí = pořadí v panelu) a podlaží.
@@ -602,7 +604,7 @@
     const patroZDat = vyskaPatra(tags);
     h += `<div class="bp-radek"><label>Výška patra</label>` +
       `<input class="bp-cislo bp-patro" value="${vychoziPatro(tags)}"> m ` +
-      `<button type="button" data-akce="vyska" title="height = podlaží × výška patra + výška střechy (přepíše height)">Dopočítat výšku</button>` +
+      `<button type="button" class="bp-tl" data-akce="vyska" title="height = podlaží × výška patra + výška střechy (přepíše height)">Dopočítat výšku</button>` +
       `<span class="bp-info">${patroZDat !== null ? 'z dat vychází ' + esc(zaokrouhli(patroZDat)) + ' m na patro' : 'jen pomůcka pro výpočet, do OSM se nezapisuje'}</span></div>`;
     h += `</div>`;
 
@@ -674,10 +676,10 @@
 
     // Věže / části budovy
     if (jeCast && !tags['roof:shape']) {
-      h += `<div class="bp-sekce"><button type="button" data-akce="vez">Předvyplnit jako věž (roof:shape=pyramidal)</button></div>`;
+      h += `<div class="bp-sekce"><button type="button" class="bp-tl" data-akce="vez">Předvyplnit jako věž (roof:shape=pyramidal)</button></div>`;
     }
     if (jeCast) {
-      h += `<div class="bp-sekce"><button type="button" data-akce="prujezd" title="doplní min_height=4 a building:min_level=1 (jen prázdné)">Část nad průjezdem</button></div>`;
+      h += `<div class="bp-sekce"><button type="button" class="bp-tl" data-akce="prujezd" title="doplní min_height=4 a building:min_level=1 (jen prázdné)">Část nad průjezdem</button></div>`;
     }
     h += `<details><summary>Jak udělat průjezd budovou</summary>` +
       `<ol><li>Nástrojem <b>Plocha</b> obkresli zvlášť část budovy <b>nad průjezdem</b> a zvlášť zbytek budovy – obě jako <b>Část budovy</b>.</li>` +
