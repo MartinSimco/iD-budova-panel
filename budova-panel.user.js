@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iD – panel Budova (střechy, výšky, podlaží)
 // @namespace    osm-edit-budovy
-// @version      1.2.1
+// @version      1.3.0
 // @author       MartinSimco
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/MartinSimco/iD-budova-panel
@@ -9,7 +9,7 @@
 // (updateURL/downloadURL: Tampermonkey odtud sám stahuje nové verze)
 // @updateURL    https://raw.githubusercontent.com/MartinSimco/iD-budova-panel/main/budova-panel.user.js
 // @downloadURL  https://raw.githubusercontent.com/MartinSimco/iD-budova-panel/main/budova-panel.user.js
-// @description  Vizuální panel pro 3D atributy budov v editoru iD na openstreetmap.org: boční řez s kótami, předvolby typů budov (panelák, rodinný dům, hala …), tvar a sklon střechy, podlaží, dopočet výšky, barvy, materiály, bez oken, průjezdy a upozornění.
+// @description  Vizuální panel pro 3D atributy budov v editoru iD na openstreetmap.org: živý 3D náhled, boční řez s kótami, předvolby typů budov (panelák, rodinný dům, hala …), tvar a sklon střechy, podlaží, dopočet výšky, barvy, materiály, bez oken, průjezdy a upozornění.
 // @match        https://www.openstreetmap.org/id*
 // @run-at       document-idle
 // @grant        GM_addStyle
@@ -685,6 +685,37 @@
     return id ? { id, pocet: id.split(',').length } : { id: null, pocet: 0 };
   }
 
+  // Půdorys cesty (budovy) tak, jak ji iD právě kreslí v mapě – i s neuloženými úpravami.
+  // Vrací { pts: body v metrech (vůči rohu obrazovky), orez: budova přesahuje výřez } nebo null
+  // (relace, bod, budova mimo výřez). Měřítko px → m bereme ze zoomu a šířky v adrese.
+  function nactiPudorys(id) {
+    if (!/^w-?\d+$/.test(id)) return null;
+    const path = document.querySelector(`.layer-osm path.area.stroke.${id}`) || document.querySelector(`.layer-osm path.stroke.${id}`);
+    const m = location.hash.match(/map=([\d.]+)\/([\d.-]+)\//);
+    if (!path || !m) return null;
+    const pts = pudorysZCesty(path.getAttribute('d'), mNaPx(Number(m[1]), Number(m[2])));
+    if (pts.length < 3) return null;
+    // iD ořezává cesty na okraji mapy → budova, která přesahuje výřez, by měla useknutý půdorys
+    const mapa = document.querySelector('.main-map'), r = path.getBoundingClientRect(), mr = mapa ? mapa.getBoundingClientRect() : r;
+    const orez = r.left < mr.left + 1 || r.top < mr.top + 1 || r.right > mr.right - 1 || r.bottom > mr.bottom - 1;
+    return { pts, orez };
+  }
+
+  // Uložené značky budov z OSM API – pro náhled více vybraných budov (iD u nich ukazuje
+  // rozdílné hodnoty jen jako "*"). Načítá se jednou na budovu; po načtení se panel překreslí.
+  const ulozene = {};
+  let nacitamUlozene = false;
+  function nactiUlozene(ids) {
+    const chybi = ids.filter(id => /^w\d+$/.test(id) && !(id in ulozene));
+    if (!chybi.length || nacitamUlozene) return;
+    nacitamUlozene = true;
+    fetch('https://api.openstreetmap.org/api/0.6/ways.json?ways=' + chybi.map(i => i.slice(1)).join(','))
+      .then(r => r.json())
+      .then(j => { for (const e of j.elements || []) ulozene['w' + e.id] = e.tags || {}; })
+      .catch(() => {})
+      .finally(() => { for (const id of chybi) if (!(id in ulozene)) ulozene[id] = {}; nacitamUlozene = false; posledniKlic = null; });
+  }
+
   // Volá callback(vyberInfo()), kdykoliv se v bočním panelu něco změní (výběr, přerenderování,
   // úprava značek). Změna hodnoty textového pole není změna DOM, proto posloucháme
   // i události input/change. Debounce 150 ms: iD při překreslení mění DOM mnohokrát
@@ -746,6 +777,9 @@
     #budova-panel .bp-info { color: #555; font-size: 11px; }
     /* samostatná tlačítka (Dopočítat výšku, Část nad průjezdem, věž) – iD by z nich udělalo holý text */
     #budova-panel button.bp-tl { height: auto; min-width: 0; padding: 3px 8px; font-size: 11px; color: #2b7bd6; background: #fff; border: 1px solid #2b7bd6; border-radius: 4px; }
+    #budova-panel button.bp-tl.bp-aktivni { color: #fff; background: #2b7bd6; }
+    #budova-panel .bp-3d-obal { border: 1px solid #ddd; border-radius: 4px; background: linear-gradient(#e9f1fa, #fbfcfd); cursor: grab; user-select: none; }
+    #budova-panel .bp-3d-obal svg { width: 100%; display: block; }
   `;
 
   // Popisky polí pro výšky (pořadí = pořadí v panelu) a podlaží.
@@ -779,9 +813,31 @@
       `<span class="bp-klic">window=no – sklady, trafostanice, garáže; 3D mapy pak nekreslí okna</span></div>`;
   }
 
+  // Natočení 3D náhledu (°) a naposledy kreslené modely – drží se mezi překresleními panelu,
+  // aby otáčení myší nemuselo pokaždé znovu skládat celý panel.
+  let azimut3d = 30;
+  let modely3d = [];
+  const prekresli3d = () => {
+    const o = document.querySelector('#budova-panel .bp-3d-obal');
+    if (o) o.innerHTML = svg3d(modely3d, azimut3d);
+  };
+
+  // Sekce „3D náhled“: kresba + otáčení + (u uložené budovy) věrný náhled v OSMBuilding.
+  function htmlNahledu(modely, poznamky, vernyId) {
+    modely3d = modely;
+    let h = `<div class="bp-sekce"><b>3D náhled</b> <span class="bp-info">živě, i s neuloženými změnami – otáčej tažením myši</span>` +
+      `<div class="bp-3d-obal">${svg3d(modely, azimut3d)}</div><div class="bp-radek">` +
+      `<button type="button" class="bp-tl" data-akce="otoc3d" data-krok="-30" title="otočit doleva">⟲</button>` +
+      `<button type="button" class="bp-tl" data-akce="otoc3d" data-krok="30" title="otočit doprava">⟳</button>`;
+    if (vernyId) h += `<button type="button" class="bp-tl" data-akce="verny" data-hodnota="${esc(vernyId)}" title="OSMBuilding v novém okně – i části budovy (věže), ale jen uložená data">Věrný náhled (uložený stav)</button>`;
+    h += `</div>`;
+    for (const p of [...new Set(poznamky)]) h += `<div class="bp-info">ℹ ${esc(p)}</div>`;
+    return h + `</div>`;
+  }
+
   // Zúžený panel při výběru více budov: jen to, co jde bezpečně zapsat všem najednou.
-  function htmlHromadne(tags, pocet) {
-    let h = `<h3>🏘 Vybráno ${pocet} prvků</h3>`;
+  function htmlHromadne(tags, pocet, nahled) {
+    let h = `<h3>🏘 Vybráno ${pocet} prvků</h3>` + nahled;
     if (!tags.building || tags.building === '*') {
       // Smíšené building= (nebo nejsou všechno budovy) – nevíme, jestli by se střecha
       // nezapsala třeba i silnici, proto nic nenabízet.
@@ -803,10 +859,10 @@
   }
 
   // Sestaví HTML celého panelu z aktuálních značek. Nic nezapisuje – jen kreslí.
-  function htmlPanelu(tags) {
+  function htmlPanelu(tags, nahled) {
     const jeCast = tags['building:part'] !== undefined;
     const nazev = tags.name ? ' – ' + esc(tags.name) : '';
-    let h = `<h3>🏠 ${jeCast ? 'Část budovy' : 'Budova'}${nazev}</h3>`;
+    let h = `<h3>🏠 ${jeCast ? 'Část budovy' : 'Budova'}${nazev}</h3>` + (nahled || '');
 
     // Předvolby typů (jen u celé budovy – části mají vlastní logiku: věže, průjezdy)
     if (!jeCast) {
@@ -851,7 +907,16 @@
       for (const s of SMERY) {
         h += `<button type="button" class="${ted === s.deg ? 'bp-aktivni' : ''}" data-akce="smer" data-hodnota="${s.deg}" title="roof:direction=${s.deg}">${s.label}</button>`;
       }
-      h += `</span><span class="bp-klic">roof:direction – kam stéká voda</span></div>`;
+      h += `</span><button type="button" class="bp-tl" data-akce="otoc180" title="spád na opačnou stranu">Otočit o 180°</button>` +
+        `<span class="bp-klic">roof:direction – kam stéká voda</span></div>`;
+    }
+    // Hřeben podél / napříč – u střech s hřebenem (výchozí v OSM je „podél delší strany“)
+    if (ORIENTOVATELNE.includes(tags['roof:shape'])) {
+      const o = tags['roof:orientation'];
+      h += `<div class="bp-radek"><label>Hřeben</label>` +
+        `<button type="button" class="bp-tl${o === 'along' ? ' bp-aktivni' : ''}" data-akce="hreben" data-hodnota="along">podél delší strany</button>` +
+        `<button type="button" class="bp-tl${o === 'across' ? ' bp-aktivni' : ''}" data-akce="hreben" data-hodnota="across">napříč</button>` +
+        `<span class="bp-klic">roof:orientation${o ? '' : ' – nezadáno = podél'}</span></div>`;
     }
     h += `</div>`;
 
@@ -957,6 +1022,19 @@
         break;
       }
       case 'smer': zapis({ 'roof:direction': b.dataset.hodnota }); break;
+      case 'otoc180': {
+        const z = otocO180(tags);
+        if (!Object.keys(z).length) { zobrazZpravu('Nejdřív zvol směr spádu šipkou – pak ho jde otáčet.'); break; }
+        zapis(z);
+        break;
+      }
+      case 'hreben': zapis({ 'roof:orientation': b.dataset.hodnota }); break;
+      case 'otoc3d': azimut3d += Number(b.dataset.krok); prekresli3d(); break;   // jen kresba, nic se nezapisuje
+      case 'verny': {
+        const id = b.dataset.hodnota;                                       // "w123" / "r123"
+        window.open('https://beakerboy.github.io/OSMBuilding/?type=' + (id[0] === 'r' ? 'relation' : 'way') + '&id=' + id.slice(1), '_blank', 'noopener');
+        break;
+      }
       case 'prujezd': zapis(zmenyPrujezd(tags)); break;
       case 'strecha': zapis({ 'roof:shape': b.dataset.hodnota }); break;
       case 'barva': zapis({ [b.dataset.klic]: b.dataset.hodnota }); break;
@@ -1008,7 +1086,33 @@
     // Jeden prvek se "*" by byl nesmysl (ručně napsaná hodnota "*") → panel nezobrazovat.
     if (!hromadne && Object.values(tags).includes('*')) return skryj();
 
-    const klic = info.id + '|' + ta.value;
+    // 3D náhled: půdorysy z mapy iD (živě) + značky. U jedné budovy značky z panelu; u víc
+    // budov uložené značky každé z nich (OSM API) + společné hodnoty z panelu (ne "*").
+    const ids = info.id.split(',');
+    if (hromadne) nactiUlozene(ids);
+    const pudy = ids.map(nactiPudorys);
+    const vidim = pudy.filter(Boolean);
+    const vse = vidim.flatMap(p => p.pts);
+    // posun ke společnému středu → malá čísla (přesnost) a stabilní klíč při posunu mapy
+    const sx = vse.length ? (Math.min(...vse.map(p => p[0])) + Math.max(...vse.map(p => p[0]))) / 2 : 0;
+    const sy = vse.length ? (Math.min(...vse.map(p => p[1])) + Math.max(...vse.map(p => p[1]))) / 2 : 0;
+    const spolecne = Object.fromEntries(Object.entries(tags).filter(([, v]) => v !== '*'));
+    const modely = [], poznamky = [];
+    ids.forEach((id, i) => {
+      if (!pudy[i]) return;
+      const pts = pudy[i].pts.map(p => [p[0] - sx, p[1] - sy]);
+      const m = model3d(hromadne ? Object.assign({}, ulozene[id] || {}, spolecne) : tags, pts);
+      modely.push(m);
+      if (!hromadne) poznamky.push(...m.poznamky);
+    });
+    if (!vidim.length) poznamky.push('budova není v mapě vidět – posuň nebo oddal mapu');
+    else if (vidim.length < ids.length) poznamky.push('některé vybrané budovy nejsou v mapě vidět');
+    if (vidim.some(p => p.orez)) poznamky.push('budova není celá ve výřezu mapy – náhled může být useknutý');
+    if (hromadne) poznamky.push('každá budova podle svých uložených hodnot + společné změny z panelu');
+    const verny = !hromadne && /^[wr]\d+$/.test(info.id) ? info.id : null;     // jen uložená budova
+    const geo = vse.map(p => (p[0] - sx).toFixed(1) + ',' + (p[1] - sy).toFixed(1)).join(';');
+
+    const klic = info.id + '|' + ta.value + '|' + geo + '|' + Object.keys(ulozene).length;
     if (stary && stary.parentNode === telo && klic === posledniKlic) return; // nic se nezměnilo
     if (stary && stary.contains(document.activeElement) && document.activeElement.tagName === 'INPUT' && document.activeElement.type !== 'color') return; // uživatel právě píše
 
@@ -1021,9 +1125,20 @@
       panel.addEventListener('change', onZmena);
       // Enter v číselném poli = potvrdit (vyvolá change přes blur)
       panel.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.classList.contains('bp-cislo')) e.target.blur(); });
+      // Otáčení 3D náhledu tažením myši: vodorovný posun = změna azimutu (překresluje se jen kresba)
+      panel.addEventListener('mousedown', e => {
+        if (!e.target.closest('.bp-3d-obal')) return;
+        e.preventDefault();
+        const x0 = e.clientX, a0 = azimut3d;
+        const pohyb = ev => { azimut3d = a0 + (ev.clientX - x0) * 0.7; prekresli3d(); };
+        const konec = () => { document.removeEventListener('mousemove', pohyb); document.removeEventListener('mouseup', konec); };
+        document.addEventListener('mousemove', pohyb);
+        document.addEventListener('mouseup', konec);
+      });
       telo.prepend(panel);
     }
-    panel.innerHTML = hromadne ? htmlHromadne(tags, info.pocet) : htmlPanelu(tags);
+    const nahled = htmlNahledu(modely, poznamky, verny);
+    panel.innerHTML = hromadne ? htmlHromadne(tags, info.pocet, nahled) : htmlPanelu(tags, nahled);
     // Značka s mezerou na okraji: upozornit hned, ne až když zápis odmítne
     const duvod = duvodNezapsat(ta.value, hromadne);
     if (duvod) zobrazZpravu(duvod);
