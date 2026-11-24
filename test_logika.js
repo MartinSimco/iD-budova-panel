@@ -173,7 +173,37 @@ assert.ok(Math.min(...most.plochy.flatMap(f => f.body).map(b => b[2])) === 4);
 
 // --- SVG: polygony, žádný neošetřený text z dat ---
 const s3 = L.svg3d([podel], 30);
-assert.ok(s3.startsWith('<svg') && (s3.match(/<polygon/g) || []).length >= 8);
+// 8 ploch (4 stěny, 2 strany střechy, 2 štíty) – odvrácené se nekreslí, takže jich je méně
+assert.ok(s3.startsWith('<svg') && (s3.match(/<polygon/g) || []).length >= 4 && (s3.match(/<polygon/g) || []).length < 8);
+
+// --- v1.3.1 perspektiva: stěny vždy proti směru hodin (vnější normála míří ven z budovy) ---
+for (const p of [dum, dum.slice().reverse()]) {
+  const m = L.model3d({ building: 'yes', height: '6' }, p);
+  for (const f of m.plochy.filter(x => x.druh === 'stena')) {
+    const [a, b] = f.body, n = [b[1] - a[1], -(b[0] - a[0])], mid = [(a[0] + b[0]) / 2 - 5, (a[1] + b[1]) / 2 - 2];
+    assert.ok(n[0] * mid[0] + n[1] * mid[1] > 0, 'stěna musí mířit ven i u půdorysu po směru hodin');
+  }
+}
+// kvádr: vidět jsou 2 stěny + střecha (zadní stěny vynechané), střecha až po stěnách,
+// svislé hrany stěn zůstávají svislé, vodorovné hrany se sbíhají (= skutečná perspektiva)
+const polygony = s => [...s.matchAll(/points="([^"]+)" fill="([^"]+)"/g)].map(m => ({ b: m[1].split(' ').map(t => t.split(',').map(Number)), fill: m[2] }));
+const kv = polygony(L.svg3d([L.model3d({ building: 'yes', height: '6', 'roof:colour': '#0000ff' }, dum)], 30));
+assert.strictEqual(kv.length, 3);
+assert.ok(/^rgb\(0,0,\d+\)$/.test(kv[2].fill));                                  // střecha poslední
+for (const w of kv.slice(0, 2)) assert.ok(Math.abs(w.b[0][0] - w.b[3][0]) < 0.11 && Math.abs(w.b[1][0] - w.b[2][0]) < 0.11);
+const r = kv[2].b, e1 = [r[1][0] - r[0][0], r[1][1] - r[0][1]], e2 = [r[2][0] - r[3][0], r[2][1] - r[3][1]];
+assert.ok(Math.abs(e1[0] * e2[1] - e1[1] * e2[0]) > 1, 'protější hrany střechy nemají být rovnoběžné');
+// dvě budovy: pohled od jihu (azimut 0) → nejdřív celá severní (vzdálená), pak celá jižní
+const posun = (p, dy) => p.map(([x, y]) => [x, y + dy]);
+const dvo = polygony(L.svg3d([L.model3d({ building: 'yes', height: '6', 'building:colour': '#ff0000', 'roof:colour': '#ff0000' }, posun(dum, 30)),
+  L.model3d({ building: 'yes', height: '6', 'building:colour': '#00ff00', 'roof:colour': '#00ff00' }, posun(dum, -30))], 0));
+const jeCervena = f => /^rgb\(\d+,0,0\)$/.test(f.fill);
+assert.ok(dvo.length > 2 && dvo.findIndex(f => !jeCervena(f)) > dvo.map(jeCervena).lastIndexOf(true));
+// kopule na tamburu: i když má střed o kus dál od kamery, kreslí se až po tamburu (jinak ji zakryje jeho střecha)
+const tambur = [[0, 0], [8, 0], [8, 8], [0, 8]];
+const kk = polygony(L.svg3d([L.model3d({ 'building:part': 'yes', height: '10', 'building:colour': '#ff0000', 'roof:colour': '#ff0000' }, tambur),
+  L.model3d({ 'building:part': 'yes', height: '14', min_height: '10', 'roof:height': '4', 'roof:shape': 'dome', 'building:colour': '#00ff00', 'roof:colour': '#00ff00' }, [[1, 2], [7, 2], [7, 7.5], [1, 7.5]])], 0));
+assert.ok(kk.findIndex(f => !jeCervena(f)) > kk.map(jeCervena).lastIndexOf(true), 'kopule se musí kreslit po tamburu');
 assert.ok(!L.svg3d([L.model3d({ building: 'yes', height: '5', 'building:colour': '"><script>' }, dum)], 0).includes('<script>'));
 assert.ok(L.svg3d([], 0).includes('<svg'));                                       // prázdný model nespadne
 

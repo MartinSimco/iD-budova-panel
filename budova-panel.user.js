@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iD – panel Budova (střechy, výšky, podlaží)
 // @namespace    osm-edit-budovy
-// @version      1.3.0
+// @version      1.3.1
 // @author       MartinSimco
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/MartinSimco/iD-budova-panel
@@ -369,6 +369,9 @@
   function model3d(tags, pts) {
     const poznamky = [], plochy = [];
     if (!pts || pts.length < 3) return { plochy, poznamky: ['půdorys není k dispozici'] };
+    // Půdorys vždy proti směru hodinových ručiček (kladná „Gaussova“ plocha). Pak u každé stěny
+    // a→b víme, že vnější normála je (b.y−a.y, −(b.x−a.x)) – náhled podle ní skryje odvrácené stěny.
+    if (pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p[0] * q[1] - q[0] * p[1]; }, 0) < 0) pts = pts.slice().reverse();
     const tvar = tags['roof:shape'] || 'flat';
     const fasada = barvaKresleni(tags['building:colour'], '#e6e1d6');
     const strecha = barvaKresleni(tags['roof:colour'], '#a5684a');
@@ -472,9 +475,12 @@
     return `rgb(${[(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(v * k)).join(',')})`;
   }
 
-  // Kresba modelů do SVG 300×200: otočení kolem svislé osy o azimut (°), pohled od jihu
-  // shora pod úhlem 35°. Plochy se kreslí odzadu dopředu („malířův algoritmus“) a tmavnou
-  // podle toho, jak se odvracejí od světla. Měřítko nezávisí na natočení (při otáčení nepulzuje).
+  // Kresba modelů do SVG 300×200 ve „dvoubodové perspektivě“ (jako u architektonických
+  // vizualizací): vzdálenější části se zmenšují, ale svislé hrany zůstávají svislé.
+  // Model se otočí kolem svislé osy o azimut (°); kamera stojí na jihu, výš než budova,
+  // a hledí na ni shora asi pod 30°. Odvrácené plochy se nekreslí; budovy se kreslí odzadu
+  // dopředu a u každé nejdřív stěny, pak střecha. Plochy tmavnou podle toho, jak se
+  // odvracejí od světla. Měřítko nezávisí na natočení (při otáčení myší obraz nepulzuje).
   function svg3d(modely, azimut) {
     const plochy = modely.flatMap(m => m.plochy);
     const hlava = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200" class="bp-3d-svg">';
@@ -484,27 +490,64 @@
     const y0 = (Math.min(...vse.map(b => b[1])) + Math.max(...vse.map(b => b[1]))) / 2;
     const R = Math.max(1, ...vse.map(b => Math.hypot(b[0] - x0, b[1] - y0)));
     const Hm = Math.max(1, ...vse.map(b => b[2]));
-    const e = 35 * Math.PI / 180, ce = Math.cos(e), se = Math.sin(e);
-    const k = Math.min(280 / (2 * R), 180 / (2 * R * se + Hm * ce));
-    const a = azimut * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
-    const rot = b => { const x = b[0] - x0, y = b[1] - y0; return [x * ca - y * sa, x * sa + y * ca, b[2]]; };
+    // Kamera: vodorovně Dh jižně od středu (4× poloměr scény – menší = víc zkreslení, jako širokoúhlý objektiv),
+    // ve výšce zc. Promítání dělí jen VODOROVNOU hloubkou (y + Dh), ne skutečnou vzdáleností
+    // → body nad sebou mají stejné x na obrazovce, tj. svislé hrany zůstanou svislé.
+    const Dh = 4 * Math.hypot(R, Hm * 0.6), zc = Hm * 0.4 + Dh * Math.tan(30 * Math.PI / 180);
+    const cam = [0, -Dh, zc];
+    const promitni = q => { const h = q[1] + Dh; return [q[0] / h, -(q[2] - zc) / h]; };
+    const otoc = (b, a) => { const x = b[0] - x0, y = b[1] - y0, c = Math.cos(a), s = Math.sin(a); return [x * c - y * s, x * s + y * c, b[2]]; };
+    // Měřítko a posun spočítáme přes všechna natočení po 15°, aby se kresba vešla vždy.
+    let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
+    for (let az = 0; az < 360; az += 15) for (const b of vse) {
+      const q = promitni(otoc(b, az * Math.PI / 180));
+      mnx = Math.min(mnx, q[0]); mxx = Math.max(mxx, q[0]); mny = Math.min(mny, q[1]); mxy = Math.max(mxy, q[1]);
+    }
+    const k = Math.min(280 / (mxx - mnx || 1), 180 / (mxy - mny || 1)), sx = (mnx + mxx) / 2, sy = (mny + mxy) / 2;
+    const naObrazovku = p => { const q = promitni(p); return (150 + (q[0] - sx) * k).toFixed(1) + ',' + (100 + (q[1] - sy) * k).toFixed(1); };
+    const a = azimut * Math.PI / 180;
     const svetlo = (() => { const v = [-0.4, -0.5, 0.75], d = Math.hypot(...v); return v.map(c => c / d); })();
-    const kresba = plochy.map(f => {
-      const b = f.body.map(rot);
-      // normála plochy z prvních bodů, které neleží na přímce
-      let n = [0, 0, 1];
+    const skal = (u, w) => u[0] * w[0] + u[1] * w[1] + u[2] * w[2];                 // skalární součin
+    const prumer = b => [0, 1, 2].map(i => b.reduce((s, p) => s + p[i], 0) / b.length);
+    // Normála plochy z prvních bodů, které neleží na přímce (vektorový součin); null = plocha bez obsahu.
+    const normala = b => {
       for (let i = 2; i < b.length; i++) {
         const u = [b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]], w = [b[i][0] - b[0][0], b[i][1] - b[0][1], b[i][2] - b[0][2]];
         const c = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]], d = Math.hypot(...c);
-        if (d > 1e-9) { n = c.map(x => x / d); break; }
+        if (d > 1e-9) return c.map(x => x / d);
       }
-      const jas = 0.55 + 0.45 * Math.abs(n[0] * svetlo[0] + n[1] * svetlo[1] + n[2] * svetlo[2]);
-      const hloubka = b.reduce((s, p) => s + p[1] * ce - p[2] * se, 0) / b.length;  // dál = větší
-      const body = b.map(p => (150 + p[0] * k).toFixed(1) + ',' + (190 - R * se * k - (p[2] * ce + p[1] * se) * k).toFixed(1)).join(' ');
-      return { hloubka, svg: `<polygon points="${body}" fill="${stin(f.barva, jas)}" stroke="#333" stroke-width="0.4" stroke-linejoin="round"/>` };
+      return null;
+    };
+    const budovy = modely.filter(m => m.plochy.length).map(m => {
+      const b3 = m.plochy.map(f => f.body.map(p => otoc(p, a)));
+      const z = b3.flat().map(p => p[2]);
+      const stred = prumer(b3.flat()); stred[2] = (Math.min(...z) + Math.max(...z)) / 2;
+      const steny = [], strechy = [];
+      m.plochy.forEach((f, i) => {
+        const b = b3[i], t = prumer(b);
+        let n = normala(b);
+        if (!n) return;
+        // Stěny: půdorys je proti směru hodin, takže normála už míří ven (platí i u budov do L,
+        // kde by „ven od středu“ selhalo). Střechy a štíty: otočíme ji ven od středu budovy.
+        if (f.druh !== 'stena' && skal(n, [t[0] - stred[0], t[1] - stred[1], t[2] - stred[2]]) < 0) n = n.map(x => -x);
+        if (skal(n, [cam[0] - t[0], cam[1] - t[1], cam[2] - t[2]]) <= 0) return;  // odvrácená od kamery
+        const jas = 0.55 + 0.45 * Math.abs(skal(n, svetlo));
+        (f.druh === 'strecha' ? strechy : steny).push({ h: t[1], svg: `<polygon points="${b.map(naObrazovku).join(' ')}" fill="${stin(f.barva, jas)}" stroke="#333" stroke-width="0.4" stroke-linejoin="round"/>` });
+      });
+      const odzadu = (p, q) => q.h - p.h;                                          // větší y = dál od kamery
+      // obdélník kolem budovy v natočených souřadnicích – kvůli poznání „co stojí na čem“
+      const xs = b3.flat().map(p => p[0]), ys = b3.flat().map(p => p[1]);
+      return { h: stred[1], zMin: Math.min(...z), zMax: Math.max(...z), x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys),
+        svg: steny.sort(odzadu).concat(strechy.sort(odzadu)).map(x => x.svg).join('') };
     });
-    kresba.sort((p, q) => q.hloubka - p.hloubka);
-    return hlava + kresba.map(x => x.svg).join('') + '</svg>';
+    // p „stojí na“ q: začíná až nahoře na q a půdorysem se vejde nad q (tolerance 0,5 m) – kopule
+    // na tamburu, cibule na věži, lucerna na kopuli. Ta se kreslí až po q, jinak ji zakryje
+    // střecha q. Ostatní budovy odzadu dopředu podle středu.
+    // ponytail: přibližné pořadí (malířův algoritmus) – u hodně se prolínajících tvarů může
+    // kousek přečnívat špatně; přesné řešení by byl z-buffer (canvas/WebGL).
+    const naNi = (p, q) => p.zMin >= q.zMax - 0.5 && p.x0 >= q.x0 - 0.5 && p.x1 <= q.x1 + 0.5 && p.y0 >= q.y0 - 0.5 && p.y1 <= q.y1 + 0.5;
+    budovy.sort((p, q) => naNi(p, q) ? 1 : naNi(q, p) ? -1 : q.h - p.h);
+    return hlava + budovy.map(x => x.svg).join('') + '</svg>';
   }
 
   // Kontrola PŘED zápisem: vrátí důvod, proč panel nesmí zapsat, nebo null.
