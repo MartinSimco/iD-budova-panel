@@ -9,7 +9,7 @@ vizuální panel pro 3D atributy – místo hledání klíčů jako `roof:height
 ## Co umí
 
 - **Živý 3D náhled** vybrané budovy (i víc budov) přímo v panelu – půdorys z mapy iD, výšky, střecha
-  a barvy ze značek, i neuložené změny; otáčení tažením myši. Kreslí se v perspektivě se svislými hranami (jako architektonická vizualizace), odvrácené plochy se skrývají. Tlačítko **Věrný náhled** otevře
+  a barvy ze značek, i neuložené změny; otáčení tažením myši. Kreslí se v perspektivě se svislými hranami (jako architektonická vizualizace), odvrácené plochy se skrývají. Valbové a sedlové střechy nad půdorysem do L, T, U nebo jiného mnohoúhelníku se počítají rovným skeletem (jako F4map či Streets GL), takže střecha sedí přesně na budově. Tlačítko **Věrný náhled** otevře
   [OSMBuilding](https://beakerboy.github.io/OSMBuilding/) s uloženým stavem (i části budovy).
 - **Otočení střechy** – hřeben podél delší strany / napříč (`roof:orientation`), pultová střecha o 180°.
 - **Boční řez** budovy, který se živě překresluje – stěny, střecha, kóty `height`, `roof:height`, `min_height`

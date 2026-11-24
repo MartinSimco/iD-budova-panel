@@ -213,4 +213,54 @@ assert.deepStrictEqual(L.otocO180({ 'roof:direction': 'NW' }), { 'roof:direction
 assert.deepStrictEqual(L.otocO180({}), {});
 assert.ok(L.ORIENTOVATELNE.includes('gabled') && !L.ORIENTOVATELNE.includes('skillion'));
 
+// --- v1.4 rovný skelet: střecha nad půdorysem do L, T, U… (ne nad obdélníkem kolem něj) ---
+const plocha2d = b => Math.abs(b.reduce((s, p, i) => { const q = b[(i + 1) % b.length]; return s + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2;
+const vzdalPrimky = (p, a, b) => Math.abs((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / Math.hypot(b[0] - a[0], b[1] - a[1]);
+const kontrolaSkeletu = (pud, plochaOcek, hmaxOcek, popis) => {
+  const s = L.rovnySkelet(pud);
+  assert.ok(s, popis + ': skelet se nespočítal');
+  assert.strictEqual(s.plochy.length, pud.length, popis + ': jedna plocha střechy na každou zeď');
+  const soucet = s.plochy.reduce((a, f) => a + plocha2d(f.body), 0);
+  assert.ok(Math.abs(soucet - plochaOcek) < 0.01 * plochaOcek, popis + ': plochy střechy musí pokrýt půdorys (' + soucet.toFixed(2) + ')');
+  if (hmaxOcek !== null) assert.ok(Math.abs(s.hmax - hmaxOcek) < 1e-6, popis + ': hmax ' + s.hmax);
+  // každá plocha je rovina se sklonem 45° od své zdi: výška bodu = vzdálenost od přímky zdi
+  for (const f of s.plochy) for (const p of f.body) assert.ok(Math.abs(p[2] - vzdalPrimky(p, f.a, f.b)) < 1e-6, popis + ': bod mimo rovinu své zdi');
+  return s;
+};
+const obd = kontrolaSkeletu([[0, 0], [10, 0], [10, 4], [0, 4]], 40, 2, 'obdélník');
+assert.strictEqual(obd.plochy.filter(f => f.body.length === 3).length, 2);         // dvě valbové trojúhelníky
+const tvarL = [[0, 0], [10, 0], [10, 4], [4, 4], [4, 10], [0, 10]];
+kontrolaSkeletu(tvarL, 64, 2, 'L');
+kontrolaSkeletu([[0, 0], [12, 0], [12, 4], [8, 4], [8, 10], [4, 10], [4, 4], [0, 4]], 72, 2, 'T');
+kontrolaSkeletu([[0, 0], [12, 0], [12, 10], [8, 10], [8, 4], [4, 4], [4, 10], [0, 10]], 96, 2, 'U');
+kontrolaSkeletu([[0, 0], [6, 0], [9, 3], [12, 0], [14, 6], [7, 9], [0, 6]], plocha2d([[0, 0], [6, 0], [9, 3], [12, 0], [14, 6], [7, 9], [0, 6]]), null, 'nepravidelný');
+// skutečné křídlo rezidence na Svatém Kopečku (w357664860, 19 uzlů, místy skoro v přímce)
+const kridlo = [[-19.8, 8.59], [-6.77, -19.26], [-5.43, -22.14], [-4.42, -23.88], [2.58, -20.45], [4.0, -19.76], [2.27, -16.28], [1.8, -15.33], [1.03, -13.79], [-4.53, -2.61], [0.72, -0.15], [-2.5, 6.2], [24.01, 18.59], [21.84, 23.64], [10.85, 18.41], [8.99, 22.34], [-3.53, 16.59], [-3.52, 16.39], [-7.81, 14.33]].reverse();
+const sk = L.rovnySkelet(kridlo);
+assert.ok(sk && Math.abs(sk.plochy.reduce((a, f) => a + plocha2d(f.body), 0) - plocha2d(kridlo)) < 0.001 * plocha2d(kridlo), 'křídlo rezidence: plocha');
+// Vzorkování po 20 cm: každý bod uvnitř budovy musí ležet právě v jedné ploše střechy
+// (odhalí díry i překřížené plochy, které součet ploch neprozradí).
+const uvnitr = (p, b) => { let c = false; for (let i = 0, j = b.length - 1; i < b.length; j = i++) if ((b[i][1] > p[1]) !== (b[j][1] > p[1]) && p[0] < (b[j][0] - b[i][0]) * (p[1] - b[i][1]) / (b[j][1] - b[i][1]) + b[i][0]) c = !c; return c; };
+const pokryti = (s, pud) => { let spatne = 0, vse = 0;
+  for (let x = -30; x < 30; x += 0.2) for (let y = -30; y < 30; y += 0.2) { const p = [x + 0.013, y + 0.007]; if (!uvnitr(p, pud)) continue; vse++; if (s.plochy.filter(f => !f.stit && uvnitr(p, f.body)).length !== 1) spatne++; }
+  return spatne / vse; };
+assert.ok(pokryti(sk, kridlo) < 0.0002, 'křídlo rezidence: díry nebo překryvy ve střeše (' + (100 * pokryti(sk, kridlo)).toFixed(2) + ' %)');
+assert.ok(pokryti(L.rovnySkelet([[0, 0], [12, 0], [12, 10], [8, 10], [8, 4], [4, 4], [4, 10], [0, 10]]), [[0, 0], [12, 0], [12, 10], [8, 10], [8, 4], [4, 4], [4, 10], [0, 10]]) < 0.0002, 'U: pokrytí');
+// sedlo: konce ramen L se z valby změní na svislé štíty
+const sedloL = L.rovnySkelet(tvarL, { stity: true });
+assert.strictEqual(sedloL.plochy.filter(f => f.stit).length, 2);
+// model3d: L s valbou i sedlem už bez poznámky „nad obdélníkem“, střecha přesně nad půdorysem
+for (const tvar of ['hipped', 'gabled']) {
+  const mL = L.model3d({ building: 'yes', height: '9', 'roof:height': '3', 'roof:shape': tvar }, tvarL);
+  assert.ok(!mL.poznamky.some(t => /obdélník/.test(t)), tvar + ': ' + mL.poznamky.join(';'));
+  const strechy = mL.plochy.filter(f => f.druh === 'strecha');
+  assert.ok(Math.abs(strechy.reduce((a, f) => a + plocha2d(f.body), 0) - 64) < 0.5, tvar + ': plocha střechy');
+  assert.ok(Math.abs(Math.max(...mL.plochy.flatMap(f => f.body).map(b => b[2])) - 9) < 1e-6, tvar + ': výška');
+  assert.ok(Math.min(...strechy.flatMap(f => f.body).map(b => b[2])) >= 6 - 1e-6, tvar + ': okap ve 6 m');
+  if (tvar === 'gabled') assert.strictEqual(mL.plochy.filter(f => f.druh === 'stit').length, 2);
+}
+// valba z půdorysu po směru hodin dopadne stejně (model3d si ho otočí)
+assert.strictEqual(L.model3d({ building: 'yes', height: '9', 'roof:height': '3', 'roof:shape': 'hipped' }, tvarL.slice().reverse()).plochy.filter(f => f.druh === 'strecha').length, 6);
+assert.ok(L.svg3d([L.model3d({ building: 'yes', height: '9', 'roof:height': '3', 'roof:shape': 'gabled' }, tvarL)], 30).includes('<polygon'));
+
 console.log('OK – všechny testy prošly');

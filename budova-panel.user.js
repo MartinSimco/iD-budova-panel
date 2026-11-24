@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iD – panel Budova (střechy, výšky, podlaží)
 // @namespace    osm-edit-budovy
-// @version      1.3.1
+// @version      1.4.0
 // @author       MartinSimco
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/MartinSimco/iD-budova-panel
@@ -363,6 +363,236 @@
     return [x / (3 * A), y / (3 * A)];
   }
 
+  // ROVNÝ SKELET (straight skeleton) – algoritmus Felkel & Obdržálek (1998), přepsaný podle
+  // knihovny polyskel. Představa: všechny obvodové zdi se naráz posouvají dovnitř stejnou
+  // rychlostí. Kde se dvě posouvané zdi potkají, vznikne nároží/úžlabí; kde zmizí celá zeď,
+  // vznikne hřeben. Výška bodu střechy = o kolik se zeď do té doby posunula (sklon 45°,
+  // model3d ho pak přeškáluje na roof:height). Tak to dělají i F4map, OSM2World a Streets GL –
+  // valba pak sedí nad jakýmkoliv půdorysem (L, T, U, mnohoúhelník), ne jen nad obdélníkem.
+  //
+  // Vstup: body půdorysu [[x, y]…] (libovolná orientace). Volba stity: true = sedlová střecha –
+  // valbové trojúhelníky na koncích ramen se překlopí na svislé štíty (jako Streets GL).
+  // Výstup: { plochy: [{ a, b, body: [[x, y, h]…], stit }], hmax } – jedna plocha na každou zeď
+  // a→b; nebo null, když výpočet nevyjde (pak model3d použije starou střechu nad obdélníkem).
+  function rovnySkelet(vstup, volby) {
+    // Degenerované půdorysy (víc událostí přesně v jednom bodě, přesně rovnoběžné zdi) algoritmus
+    // občas nezvládne. Pomůže posunout body o pár milimetrů („perturbace“) a zkusit to znovu –
+    // ve výsledku to není vidět. Posun je pevný (ne náhodný), aby náhled vycházel pokaždé stejně.
+    // ponytail: nanejvýš 3 pokusy; co nevyjde ani pak, kreslí model3d starou střechou nad obdélníkem.
+    for (let pokus = 0; pokus < 4; pokus++) {
+      const k = [0, 0.002, 0.005, 0.011][pokus];
+      const s = rovnySkeletJednou(vstup.map((p, i) => [p[0] + k * Math.sin(i * 1.7), p[1] + k * Math.cos(i * 2.3)]), volby);
+      if (s) return s;
+    }
+    return null;
+  }
+  function rovnySkeletJednou(vstup, volby) {
+    const EPS = 1e-9;
+    const sub = (a, b) => [a[0] - b[0], a[1] - b[1]], add = (a, b) => [a[0] + b[0], a[1] + b[1]];
+    const mul = (a, k) => [a[0] * k, a[1] * k], dot = (a, b) => a[0] * b[0] + a[1] * b[1];
+    const cross = (a, b) => a[0] * b[1] - a[1] * b[0];
+    const norm = v => { const l = Math.hypot(v[0], v[1]); return l < EPS ? [0, 0] : [v[0] / l, v[1] / l]; };
+    const stejne = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-7;
+
+    // 1) Úklid: pryč opakované body a body skoro v přímce (osa úhlu 180° by byla neurčitá).
+    let q = vstup.map(p => [p[0], p[1]]);
+    for (let zmena = true; zmena && q.length > 3;) {
+      zmena = false;
+      for (let i = 0; i < q.length && q.length > 3; i++) {
+        const a = q[(i - 1 + q.length) % q.length], p = q[i], b = q[(i + 1) % q.length];
+        const u = norm(sub(p, a)), w = norm(sub(b, p));
+        if (Math.hypot(p[0] - a[0], p[1] - a[1]) < 1e-6 || (Math.abs(cross(u, w)) < 0.01 && dot(u, w) > 0)) { q.splice(i, 1); zmena = true; i--; }
+      }
+    }
+    if (q.length < 3) return null;
+    // polyskel počítá s obvodem po směru hodinových ručiček (vnitřek vpravo od směru hrany)
+    if (q.reduce((s, p, i) => { const r = q[(i + 1) % q.length]; return s + p[0] * r[1] - r[0] * p[1]; }, 0) > 0) q.reverse();
+    const n = q.length;
+    const hrany = q.map((p, i) => { const b = q[(i + 1) % n]; return { id: i, a: p, b, v: norm(sub(b, p)) }; });
+    const vzdal = (h, p) => Math.abs(cross(h.v, sub(p, h.a)));              // vzdálenost od přímky zdi
+    // průsečík přímek p + t·u a r + s·w; paprsek = jen t ≥ 0 (resp. s ≥ 0)
+    const prusecik = (p, u, r, w, paprsekA, paprsekB) => {
+      const d = cross(u, w); if (Math.abs(d) < EPS) return null;
+      const rp = sub(r, p), t = cross(rp, w) / d, s = cross(rp, u) / d;
+      if ((paprsekA && t < -EPS) || (paprsekB && s < -EPS)) return null;
+      return [p[0] + t * u[0], p[1] + t * u[1]];
+    };
+
+    // 2) „Živý obvod“ (LAV = list of active vertices): vrchol má bod, zeď vlevo (končí v něm),
+    //    zeď vpravo (začíná v něm) a osu úhlu, po které se při posouvání zdí pohybuje.
+    const vrchol = (bod, hL, hP, smery) => {
+      const tvurci = [mul(hL.v, -1), hP.v], sm = smery || tvurci;
+      const reflex = cross(sm[0], sm[1]) < 0;                                  // vnitřní úhel > 180°
+      return { bod, hL, hP, reflex, osa: mul(add(tvurci[0], tvurci[1]), reflex ? -1 : 1), platny: true, prev: null, next: null, lav: null };
+    };
+    const lavy = [];
+    const lavZRetezce = start => { const lav = { head: start, len: 0 }; let v = start; do { v.lav = lav; lav.len++; v = v.next; } while (v !== start && lav.len < 10000); return lav; };
+    const vs = q.map((p, i) => vrchol(p, hrany[(i - 1 + n) % n], hrany[i]));
+    vs.forEach((v, i) => { v.prev = vs[(i - 1 + n) % n]; v.next = vs[(i + 1) % n]; });
+    lavy.push(lavZRetezce(vs[0]));
+    // původní zdi s osami na obou koncích – pro test, zda bod „rozdělení“ leží před zdí
+    const puvodni = vs.map(v => ({ hrana: v.hL, osaL: { p: v.prev.bod, u: v.prev.osa }, osaP: { p: v.bod, u: v.osa } }));
+
+    // 3) Nejbližší událost vrcholu: srážka s osou souseda (edge event), nebo u vrcholu s úhlem
+    //    > 180° náraz do protější zdi, který obvod rozdělí na dva (split event).
+    const dalsiUdalost = v => {
+      const ud = [];
+      if (v.reflex) for (const oe of puvodni) {
+        if (oe.hrana === v.hL || oe.hrana === v.hP) continue;
+        const vlastni = Math.abs(dot(v.hL.v, oe.hrana.v)) < Math.abs(dot(v.hP.v, oe.hrana.v)) ? v.hL : v.hP;
+        const i = prusecik(vlastni.a, vlastni.v, oe.hrana.a, oe.hrana.v, false, false);
+        if (!i || stejne(i, v.bod)) continue;
+        const lin = norm(sub(v.bod, i));
+        let ed = oe.hrana.v; if (dot(lin, ed) < 0) ed = mul(ed, -1);
+        const bis = add(ed, lin); if (Math.hypot(bis[0], bis[1]) < EPS) continue;
+        const b = prusecik(i, bis, v.bod, v.osa, false, true);
+        if (!b) continue;
+        const xl = cross(norm(oe.osaL.u), norm(sub(b, oe.osaL.p))) > -EPS;
+        const xr = cross(norm(oe.osaP.u), norm(sub(b, oe.osaP.p))) < EPS;
+        const xe = cross(oe.hrana.v, norm(sub(b, oe.hrana.a))) < EPS;
+        if (xl && xr && xe) ud.push({ typ: 'deleni', d: vzdal(oe.hrana, b), bod: b, v, protejsi: oe.hrana });
+      }
+      const ip = prusecik(v.bod, v.osa, v.prev.bod, v.prev.osa, true, true);
+      const inx = prusecik(v.bod, v.osa, v.next.bod, v.next.osa, true, true);
+      if (ip) ud.push({ typ: 'hrana', d: vzdal(v.hL, ip), bod: ip, a: v.prev, b: v });
+      if (inx) ud.push({ typ: 'hrana', d: vzdal(v.hP, inx), bod: inx, a: v, b: v.next });
+      if (!ud.length) return null;
+      const vzd = e => Math.hypot(e.bod[0] - v.bod[0], e.bod[1] - v.bod[1]);
+      return ud.reduce((m, e) => vzd(e) < vzd(m) ? e : m);
+    };
+
+    // Uzly skeletu (body hřebenů a nároží) a pro každý, kterých zdí se týká.
+    const uzly = [];
+    const pridejUzel = (bod, h, ids) => {
+      const u = uzly.find(x => stejne(x.bod, bod));                           // stejný bod z víc událostí
+      if (u) ids.forEach(i => u.hrany.add(i)); else uzly.push({ bod: bod.slice(), h, hrany: new Set(ids) });
+    };
+    const hranaUdalost = e => {
+      const lav = e.a.lav;
+      if (e.a.prev === e.b.next) {                                             // poslední trojúhelník = vrchol
+        lavy.splice(lavy.indexOf(lav), 1);
+        const ids = []; let v = lav.head, k = 0;
+        do { ids.push(v.hL.id, v.hP.id); v.platny = false; v = v.next; } while (v !== lav.head && ++k < 10000);
+        pridejUzel(e.bod, e.d, ids);
+        return [];
+      }
+      const nv = vrchol(e.bod, e.a.hL, e.b.hP, [norm(e.b.osa), norm(e.a.osa)]);
+      nv.lav = lav; nv.prev = e.a.prev; nv.next = e.b.next; e.a.prev.next = nv; e.b.next.prev = nv;
+      if (lav.head === e.a || lav.head === e.b) lav.head = nv;
+      e.a.platny = e.b.platny = false; lav.len--;
+      pridejUzel(e.bod, e.d, [e.a.hL.id, e.a.hP.id, e.b.hP.id]);
+      const u = dalsiUdalost(nv);
+      return u ? [u] : [];
+    };
+    const deleniUdalost = e => {
+      const lav = e.v.lav; let x = null, y = null;
+      hledej: for (const l of lavy) {
+        let v = l.head, k = 0;
+        do {
+          if (v.hL === e.protejsi) { x = v; y = v.prev; } else if (v.hP === e.protejsi) { y = v; x = v.next; }
+          if (x) {
+            const xl = cross(norm(y.osa), norm(sub(e.bod, y.bod))) >= -EPS, xr = cross(norm(x.osa), norm(sub(e.bod, x.bod))) <= EPS;
+            if (xl && xr) break hledej;
+            x = y = null;
+          }
+          v = v.next;
+        } while (v !== l.head && ++k < 10000);
+      }
+      if (!x) return [];
+      const v1 = vrchol(e.bod, e.v.hL, e.protejsi), v2 = vrchol(e.bod, e.protejsi, e.v.hP);
+      v1.prev = e.v.prev; v1.next = x; e.v.prev.next = v1; x.prev = v1;
+      v2.prev = y; v2.next = e.v.next; e.v.next.prev = v2; y.next = v2;
+      lavy.splice(lavy.indexOf(lav), 1);
+      let nove;
+      if (lav !== x.lav) { lavy.splice(lavy.indexOf(x.lav), 1); nove = [lavZRetezce(v1)]; }
+      else nove = [lavZRetezce(v1), lavZRetezce(v2)];
+      const zive = [];
+      for (const l of nove) {
+        if (l.len > 2) { lavy.push(l); zive.push(l.head); }
+        else { let v = l.head, k = 0; do { v.platny = false; v = v.next; } while (v !== l.head && ++k < 10); }   // zbytek = hřeben
+      }
+      e.v.platny = false;
+      pridejUzel(e.bod, e.d, [e.v.hL.id, e.v.hP.id, e.protejsi.id]);
+      return zive.map(dalsiUdalost).filter(Boolean);
+    };
+
+    // 4) Hlavní smyčka: události v pořadí podle vzdálenosti (= výšky střechy).
+    let fronta = vs.map(dalsiUdalost).filter(Boolean), pojistka = 0;
+    while (fronta.length && lavy.length && pojistka++ < 20000) {
+      fronta.sort((a, b) => a.d - b.d);
+      const e = fronta.shift();
+      if (e.typ === 'hrana') { if (!e.a.platny || !e.b.platny) continue; fronta.push(...hranaUdalost(e)); }
+      else { if (!e.v.platny) continue; fronta.push(...deleniUdalost(e)); }
+    }
+
+    // 5) Plochy střechy: plocha zdi a→b = a, b a všechny uzly, kterých se zeď týká.
+    //    Pojistka: uzel patří k ploše zdi, jen když jeho výška = vzdálenost od přímky té zdi
+    //    (při souběhu víc událostí v jednom bodě se občas přiřadí i zeď, které se netýká).
+    //    Druhá pojistka: skutečný uzel skeletu je místo, kde se potkají aspoň tři posouvané zdi,
+    //    tedy leží ve stejné výšce nad aspoň třemi přímkami zdí. Uzel, který to nesplňuje, je
+    //    numerický artefakt (u téměř rovnoběžných zdí) a do střechy by udělal zářez s dírou.
+    const tol = 1e-6 * Math.max(1, ...q.map(p => Math.hypot(p[0], p[1])));
+    const platne = uzly.filter(u => hrany.filter(h => Math.abs(vzdal(h, u.bod) - u.h) < tol).length >= 3);
+    // Rohy půdorysu jako „uzly“ ve výšce 0 – každý roh patří ke dvěma zdem (té, co v něm končí, a té, co začíná).
+    const rohy = q.map((p, i) => ({ bod: p, h: 0 }));
+    let plochy = hrany.map((h, i) => ({ h, roh: [rohy[i], rohy[(i + 1) % n]], uzly: platne.filter(u => u.hrany.has(h.id) && Math.abs(vzdal(h, u.bod) - u.h) < tol) }));
+    if (!uzly.length || plochy.some(f => !f.uzly.length)) return null;
+
+    // Pořadí bodů po obvodu plochy z TOPOLOGIE: plocha sousedí s jinou plochou podél společné
+    // hranice a ta leží na ose úhlu mezi jejich zdmi – tedy na přímce. Body společné oběma plochám
+    // proto stačí seřadit podél té přímky a spojit; spolu se samotnou zdí a→b vznikne cyklus,
+    // který projdeme. (Pouhé řazení podle polohy podél zdi u nekonvexních ploch selhává.)
+    const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const poradi = f => {
+      const vse = [...f.roh, ...f.uzly], soused = new Map(vse.map(u => [u, []]));
+      const spoj = (x, y) => { if (x !== y && !soused.get(x).includes(y)) { soused.get(x).push(y); soused.get(y).push(x); } };
+      spoj(f.roh[0], f.roh[1]);                                                // samotná zeď
+      for (const g of plochy) {
+        if (g === f) continue;
+        const spolecne = vse.filter(u => g.roh.includes(u) || g.uzly.includes(u));
+        if (spolecne.length < 2) continue;
+        let p0 = spolecne[0], p1 = spolecne[1], dmax = -1;                     // nejvzdálenější dvojice = směr hranice
+        for (const x of spolecne) for (const y of spolecne) if (dist(x.bod, y.bod) > dmax) { dmax = dist(x.bod, y.bod); p0 = x; p1 = y; }
+        const sm = norm(sub(p1.bod, p0.bod));
+        spolecne.sort((x, y) => dot(sub(x.bod, p0.bod), sm) - dot(sub(y.bod, p0.bod), sm));
+        for (let i = 1; i < spolecne.length; i++) spoj(spolecne[i - 1], spolecne[i]);
+      }
+      if ([...soused.values()].some(s => s.length !== 2)) return null;          // není to čistý cyklus
+      const cyklus = [f.roh[0]]; let pred = f.roh[0], ted = f.roh[1];
+      while (ted !== f.roh[0] && cyklus.length <= vse.length) { cyklus.push(ted); const dalsi = soused.get(ted).find(x => x !== pred); pred = ted; ted = dalsi; }
+      return cyklus.length === vse.length ? cyklus : null;
+    };
+    plochy.forEach(f => { f.cyklus = poradi(f); });
+    // Sedlo: valbový trojúhelník (jediný uzel, sdílený právě třemi zdmi) → uzel posunout na zeď = svislý štít.
+    if (volby && volby.stity) for (const f of plochy) {
+      const u = f.uzly[0];
+      if (f.uzly.length === 1 && u.hrany.size === 3 && plochy.filter(g => g.uzly.includes(u)).length === 3) {
+        const t = dot(sub(u.bod, f.h.a), f.h.v); u.bod = [f.h.a[0] + t * f.h.v[0], f.h.a[1] + t * f.h.v[1]]; f.stit = true;
+      }
+    }
+    const hmax = Math.max(...platne.map(u => u.h));
+    // Náhradní pořadí, když topologie nedá čistý cyklus: plocha je „monotónní“ ve směru své zdi,
+    // v souřadnicích t (poloha podél zdi) a s (výška) ji přímka z nejlevějšího do nejpravějšího bodu
+    // dělí na spodní řetěz (se zdí, vzestupně) a horní (sestupně). Spolehlivé jen u konvexních ploch.
+    const obvod = f => {
+      if (f.cyklus) return f.cyklus.map(u => [u.bod[0], u.bod[1], u.h]);
+      const body = [[f.h.a[0], f.h.a[1], 0], [f.h.b[0], f.h.b[1], 0], ...f.uzly.map(u => [u.bod[0], u.bod[1], u.h])];
+      const ts = body.map(p => [dot(sub(p, f.h.a), f.h.v), p[2], p]);
+      ts.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+      const Lb = ts[0], Rb = ts[ts.length - 1], d = [Rb[0] - Lb[0], Rb[1] - Lb[1]];
+      const strana = x => cross(d, [x[0] - Lb[0], x[1] - Lb[1]]);              // < 0 = pod přímkou L→R
+      const stred = ts.slice(1, -1);
+      const spodni = stred.filter(x => strana(x) <= 0), horni = stred.filter(x => strana(x) > 0).reverse();
+      return [Lb, ...spodni, Rb, ...horni].map(x => x[2]);
+    };
+    const vysledek = plochy.map(f => ({ a: f.h.a, b: f.h.b, stit: !!f.stit, body: obvod(f) }));
+    // Kontrola: plochy (bez štítů) musí v půdoryse přesně pokrýt budovu, jinak výpočet nevyšel.
+    const pl2 = b => Math.abs(b.reduce((s, p, i) => { const r = b[(i + 1) % b.length]; return s + p[0] * r[1] - r[0] * p[1]; }, 0)) / 2;
+    const soucet = vysledek.reduce((s, f) => s + pl2(f.body), 0), cela = pl2(q);
+    if (!isFinite(hmax) || hmax <= 0 || Math.abs(soucet - cela) > 0.01 * cela) return null;
+    return { plochy: vysledek, hmax };
+  }
+
   // 3D model budovy z půdorysu (metry, raději kolem počátku – kvůli přesnosti) a značek:
   // seznam ploch {body:[[x,y,z]…], barva, druh}; druh: 'stena' (stěny po obvodu), 'stit'
   // (štíty), 'strecha'. Poznámky = co bylo odhadnuto nebo zjednodušeno.
@@ -402,11 +632,20 @@
     const sp = pts.map(p => p[0] * dvec[0] + p[1] * dvec[1]);
     const sMin = Math.min(...sp), sMax = Math.max(...sp);
 
+    // Půdorys, který není (skoro) obdélník – L, T, U, mnohoúhelník: valbu i sedlo spočítáme
+    // rovným skeletem (jako F4map nebo Streets GL), ne nad obdélníkem kolem půdorysu.
+    // Obdélníky dál kreslíme po staru – tam to sedí a funguje i roof:orientation.
+    const plochaPud = Math.abs(pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2;
+    const sedlo = tvar === 'gabled' || tvar === 'gambrel';
+    const skelet = ['hipped', 'mansard', 'half-hipped', 'gabled', 'gambrel'].includes(tvar) && plochaPud < 0.85 * ob.delka * ob.sirka
+      ? rovnySkelet(pts, { stity: sedlo }) : null;
+
     // Výšky: střecha ze značky, ze sklonu, nebo odhad; celková výška ze značky, z podlaží, nebo 10 m.
     let RH = cislo(tags['roof:height']);
     const uhel = cislo(tags['roof:angle']);
     if (isNaN(RH) && tvar !== 'flat' && uhel > 0 && uhel < 90) {
-      const rozpeti = tvar === 'skillion' ? (sMax - sMin) : (ORIENTOVATELNE.includes(tvar) ? Sp : ob.sirka / 2);
+      // vodorovná vzdálenost od okapu k hřebeni (u skeletu nejvzdálenější bod od zdí)
+      const rozpeti = tvar === 'skillion' ? (sMax - sMin) : skelet ? skelet.hmax : (ORIENTOVATELNE.includes(tvar) ? Sp : ob.sirka / 2);
       RH = Math.tan(uhel * Math.PI / 180) * rozpeti;
     }
     let H = cislo(tags.height);
@@ -452,6 +691,18 @@
       for (let k = 0; k <= n; k++) { const v = -Sp + 2 * Sp * k / n; prurez.push([v, z(v)]); }
       for (let k = 0; k < n; k++) S([bod(-Lp, prurez[k][0], prurez[k][1]), bod(Lp, prurez[k][0], prurez[k][1]), bod(Lp, prurez[k + 1][0], prurez[k + 1][1]), bod(-Lp, prurez[k + 1][0], prurez[k + 1][1])]);
       for (const u of [-Lp, Lp]) S(prurez.map(([v, zz]) => bod(u, v, zz)), 'stit');
+    } else if (skelet) {
+      // Plochy rovného skeletu: výška h (sklon 45°) přepočtená tak, aby nejvyšší bod byl v H.
+      // Normály dáme předem: střecha míří vždy nahoru, štít ven ze zdi. (Odhad „ven od středu
+      // budovy“ v náhledu u L selhává – vnitřní kout leží blíž středu než zeď.)
+      const k = RH / skelet.hmax;
+      for (const f of skelet.plochy) {
+        const body = f.body.map(([x, y, h]) => [x, y, W + h * k]);
+        // rovnySkelet vrací obvod po směru hodin → vnějšek je vlevo od směru zdi a→b
+        if (f.stit) plochy.push({ druh: 'stit', barva: fasada, body, ven: [-(f.b[1] - f.a[1]), f.b[0] - f.a[0]] });
+        else plochy.push({ druh: 'strecha', barva: strecha, body, nahoru: true });
+      }
+      if (tvar !== 'hipped' && tvar !== 'gabled') poznamky.push('tvar ' + tvar + ' kreslím zjednodušeně jako ' + (sedlo ? 'sedlový' : 'valbový'));
     } else {
       // Sedlová a valbová rodina nad obdélníkem: valba = o kolik je hřeben kratší na každém konci.
       const valba = tvar === 'hipped' || tvar === 'mansard' ? Math.min(Sp, Lp) : (tvar === 'half-hipped' ? Math.min(Sp, Lp) * 0.5 : 0);
@@ -461,7 +712,6 @@
       S([bod(Lp, Sp, W), bod(-Lp, Sp, W), hA, hB]);                               // druhá strana
       if (valba > 0) { S([bod(Lp, -Sp, W), bod(Lp, Sp, W), hB]); S([bod(-Lp, Sp, W), bod(-Lp, -Sp, W), hA]); }
       else { S([bod(Lp, -Sp, W), bod(Lp, Sp, W), hB], 'stit'); S([bod(-Lp, Sp, W), bod(-Lp, -Sp, W), hA], 'stit'); }
-      const plochaPud = Math.abs(pts.reduce((s, p, i) => { const q = pts[(i + 1) % pts.length]; return s + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2;
       if (plochaPud < 0.85 * (4 * Lp * Sp)) poznamky.push('střecha zjednodušeně nad obdélníkem kolem půdorysu');
     }
     return { plochy, poznamky };
@@ -529,7 +779,11 @@
         if (!n) return;
         // Stěny: půdorys je proti směru hodin, takže normála už míří ven (platí i u budov do L,
         // kde by „ven od středu“ selhalo). Střechy a štíty: otočíme ji ven od středu budovy.
-        if (f.druh !== 'stena' && skal(n, [t[0] - stred[0], t[1] - stred[1], t[2] - stred[2]]) < 0) n = n.map(x => -x);
+        // Když model3d směr plochy zná (rovný skelet), použijeme ho: střecha nahoru, štít ven
+        // (vektor ven natočíme stejně jako body). Jinak odhad „ven od středu budovy“.
+        if (f.nahoru) { if (n[2] < 0) n = n.map(x => -x); }
+        else if (f.ven) { const vr = [f.ven[0] * Math.cos(a) - f.ven[1] * Math.sin(a), f.ven[0] * Math.sin(a) + f.ven[1] * Math.cos(a)]; if (n[0] * vr[0] + n[1] * vr[1] < 0) n = n.map(x => -x); }
+        else if (f.druh !== 'stena' && skal(n, [t[0] - stred[0], t[1] - stred[1], t[2] - stred[2]]) < 0) n = n.map(x => -x);
         if (skal(n, [cam[0] - t[0], cam[1] - t[1], cam[2] - t[2]]) <= 0) return;  // odvrácená od kamery
         const jas = 0.55 + 0.45 * Math.abs(skal(n, svetlo));
         (f.druh === 'strecha' ? strechy : steny).push({ h: t[1], svg: `<polygon points="${b.map(naObrazovku).join(' ')}" fill="${stin(f.barva, jas)}" stroke="#333" stroke-width="0.4" stroke-linejoin="round"/>` });
@@ -674,7 +928,7 @@
    * ==================================================================== */
   const API = { ROOF_SHAPES, MATERIALS_BUILDING, MATERIALS_ROOF, COLOURS, parseTagText, serializeTags, applyChanges, normalizeNumber, checkWarnings, svgRez, obrysStrechy, duvodNezapsat, krokPodlazi,
     PREDVOLBY, SMERY, predvolbaZmeny, vypoctiVysku, vyskaPatra, navrhTypu, smerNaStupne, bezOken, zmenyOkna, zmenyPrujezd,
-    ORIENTOVATELNE, otocO180, mNaPx, pudorysZCesty, obdelnik, model3d, svg3d };
+    ORIENTOVATELNE, otocO180, mNaPx, pudorysZCesty, obdelnik, model3d, svg3d, rovnySkelet };
   if (typeof module === 'object' && module.exports) { module.exports = API; return; }
 
   /* ======================================================================
